@@ -49,6 +49,19 @@ cookies = {}
 url = ""
 
 
+def log_progress(message: str) -> None:
+    """Write a shop-level milestone to both the console and the log file.
+
+    Neither alone gives the full picture: tqdm's live bar (and tqdm.write's
+    console output) often doesn't survive Docker's log pipe reliably, while
+    the file-side per-request logs have no per-shop progress context of
+    their own — just a flat stream of URLs with no sense of how far through
+    the shop list we are.
+    """
+    tqdm.write(message)
+    logger.info(message)
+
+
 def scrape_all_shops(
     s: Scraper, start_url: str, cache_dir: Path, output_file: Path
 ) -> None:
@@ -151,8 +164,9 @@ def scrape_all_reviews(
 
     total_reviews = 0
     scraped_shops = 0
+    total_shops = len(shop_ids)
     shop_pbar = tqdm(shop_ids, desc="Shops", unit="shop")
-    for shop_id in shop_pbar:
+    for shop_num, shop_id in enumerate(shop_pbar, start=1):
         shop_pbar.set_postfix(reviews=total_reviews)
         shop_csv = output_dir / f"{shop_id}.csv"
         if shop_csv.exists():
@@ -167,13 +181,16 @@ def scrape_all_reviews(
             comments_url = s.build_url("shop_comments", shop_id)
             page_html = s.load_url(comments_url)
         if not page_html:
-            tqdm.write(f"Failed to load first review page for {shop_id}, stopping")
+            log_progress(
+                f"[{shop_num}/{total_shops}] Failed to load first review page for "
+                f"{shop_id}, stopping"
+            )
             continue
 
         soup = BeautifulSoup(page_html, "html.parser")
         last_page = s.get_last_page_number(soup)
         if not last_page:
-            tqdm.write(f"Could not determine last page for {shop_id}")
+            log_progress(f"[{shop_num}/{total_shops}] Could not determine last page for {shop_id}")
             last_page = 1
 
         shop_reviews = []
@@ -201,8 +218,9 @@ def scrape_all_reviews(
                 page_url = f"{comments_url}?p={page_num}"
                 page_html = s.load_url(page_url)
             if not page_html:
-                tqdm.write(
-                    f"Failed to load review page {page_num} for {shop_id}, stopping"
+                log_progress(
+                    f"[{shop_num}/{total_shops}] Failed to load review page "
+                    f"{page_num} for {shop_id}, stopping"
                 )
                 complete = False
                 break
@@ -236,12 +254,14 @@ def scrape_all_reviews(
         # Only a fully paged shop gets a CSV, so an interrupted one is retried
         # on the next run (cheaply, from the page cache) instead of looking done.
         if not complete:
-            tqdm.write(f"Shop {shop_id}: incomplete, CSV not written")
+            log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: incomplete, CSV not written")
             continue
 
         pd.DataFrame(shop_reviews, columns=REVIEW_COLUMNS).to_csv(shop_csv, index=False)
         scraped_shops += 1
-        tqdm.write(f"Shop {shop_id}: {len(shop_reviews)} reviews -> {shop_csv}")
+        log_progress(
+            f"[{shop_num}/{total_shops}] Shop {shop_id}: {len(shop_reviews)} reviews -> {shop_csv}"
+        )
 
     shop_pbar.close()
     logger.info(
@@ -267,8 +287,9 @@ def scrape_all_products(
 
     total_products = 0
     scraped_shops = 0
+    total_shops = len(shop_ids)
     shop_pbar = tqdm(shop_ids, desc="Shops", unit="shop")
-    for shop_id in shop_pbar:
+    for shop_num, shop_id in enumerate(shop_pbar, start=1):
         shop_pbar.set_postfix(products=total_products)
         shop_csv = output_dir / f"{shop_id}.csv"
         if shop_csv.exists():
@@ -283,14 +304,17 @@ def scrape_all_products(
             shop_url = s.build_url("shop_catalog", shop_id)
             page_html = s.load_url(shop_url)
         if not page_html:
-            tqdm.write(f"Failed to load first product page for {shop_id}, stopping")
+            log_progress(
+                f"[{shop_num}/{total_shops}] Failed to load first product page for "
+                f"{shop_id}, stopping"
+            )
             continue
 
         soup = BeautifulSoup(page_html, "html.parser")
         shop_info = s.scrape_shop_info(soup)
         last_page = s.get_last_page_number(soup)
         if not last_page:
-            tqdm.write(f"Could not determine last page for {shop_id}")
+            log_progress(f"[{shop_num}/{total_shops}] Could not determine last page for {shop_id}")
             last_page = 1
 
         shop_products = []
@@ -318,8 +342,9 @@ def scrape_all_products(
                 page_url = f"{shop_url}?p={page_num}"
                 page_html = s.load_url(page_url)
             if not page_html:
-                tqdm.write(
-                    f"Failed to load product page {page_num} for {shop_id}, stopping"
+                log_progress(
+                    f"[{shop_num}/{total_shops}] Failed to load product page "
+                    f"{page_num} for {shop_id}, stopping"
                 )
                 complete = False
                 break
@@ -351,7 +376,7 @@ def scrape_all_products(
         shop_pbar.set_postfix(products=total_products)
 
         if not complete:
-            tqdm.write(f"Shop {shop_id}: incomplete, CSV not written")
+            log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: incomplete, CSV not written")
             continue
 
         for product in shop_products:
@@ -361,7 +386,9 @@ def scrape_all_products(
             shop_csv, index=False
         )
         scraped_shops += 1
-        tqdm.write(f"Shop {shop_id}: {len(shop_products)} products -> {shop_csv}")
+        log_progress(
+            f"[{shop_num}/{total_shops}] Shop {shop_id}: {len(shop_products)} products -> {shop_csv}"
+        )
 
     shop_pbar.close()
     logger.info(
