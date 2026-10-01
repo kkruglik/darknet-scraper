@@ -5,6 +5,7 @@ import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pandas as pd
 import yaml
@@ -422,10 +423,25 @@ def main() -> None:
         if shops_file.exists():
             logger.info(f"Phase 1: skipped, {shops_file} already exists")
         else:
+            # Use the path from config, but the domain auth() actually
+            # resolved to — the configured domain goes stale as soon as the
+            # main-site mirror rotates, which happens between runs (and
+            # sometimes within one).
+            configured = urlsplit(config.scrape_shops.start_url)
+            resolved = urlsplit(s.base_url)
+            shops_start_url = urlunsplit(
+                (resolved.scheme, resolved.netloc, configured.path, configured.query, "")
+            )
+            if shops_start_url != config.scrape_shops.start_url:
+                logger.info(
+                    f"Phase 1: configured start_url domain is stale, using "
+                    f"{shops_start_url} instead of {config.scrape_shops.start_url}"
+                )
+
             logger.info("Phase 1: discovering shops from main catalog")
             scrape_all_shops(
                 s,
-                config.scrape_shops.start_url,
+                shops_start_url,
                 resolve(config.scrape_shops.cache_dir),
                 shops_file,
             )
