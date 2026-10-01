@@ -390,7 +390,7 @@ class Scraper:
             self.client.cookies.set(
                 "TCK", _decrypt_tck(key_hex, iv_hex, ciphertext_hex)
             )
-            url = href_match.group(1)
+            url = urljoin(url, href_match.group(1))
 
         raise AuthError("TCK bootstrap did not resolve within max_hops")
 
