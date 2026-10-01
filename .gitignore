@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Secrets and scraped data — config.yaml holds real credentials/API keys
+config.yaml
+data/
+reviews.csv.zip
+
+# Log files
+logs/
+
+# macOS
+.DS_Store
+

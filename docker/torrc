@@ -1,0 +1,15 @@
+# Standalone tor daemon config for running alongside the scraper in the
+# same container. Both processes talk over 127.0.0.1, so there's no need
+# to expose either port outside the container.
+
+SOCKSPort 127.0.0.1:9050
+ControlPort 127.0.0.1:9051
+
+# Cookie auth instead of a hashed password: the scraper runs as the same
+# user in the same container, so it can just read the auth cookie — no
+# shared secret to manage between this file and the app.
+CookieAuthentication 1
+
+DataDirectory /var/lib/tor
+Log notice file /var/log/tor/notices.log
+RunAsDaemon 0

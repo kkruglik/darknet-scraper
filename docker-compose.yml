@@ -1,0 +1,7 @@
+services:
+  scraper:
+    build: .
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./data:/app/data
+      - ./logs:/app/logs

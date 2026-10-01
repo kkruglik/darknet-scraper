@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+data
+config.yaml
+reviews.csv.zip
+logs
+.claude
