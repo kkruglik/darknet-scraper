@@ -1,6 +1,9 @@
+import logging
 import time
 
 import httpx2 as httpx
+
+logger = logging.getLogger(__name__)
 
 TWO_CAPTCHA_CREATE_TASK_URL = "https://api.2captcha.com/createTask"
 TWO_CAPTCHA_GET_RESULT_URL = "https://api.2captcha.com/getTaskResult"
@@ -40,6 +43,10 @@ def solve_image_captcha(
     if comment:
         task["comment"] = comment
 
+    logger.info(
+        f"2captcha: submitting image (languagePool={language_pool!r}, "
+        f"numeric={numeric}, case={case})"
+    )
     with httpx.Client(timeout=30) as client:
         resp = client.post(
             TWO_CAPTCHA_CREATE_TASK_URL,
@@ -53,10 +60,13 @@ def solve_image_captcha(
                 f"{data.get('errorDescription')}"
             )
         task_id = data["taskId"]
+        logger.info(f"2captcha: task {task_id} created, polling for a result")
 
         deadline = time.monotonic() + max_wait
+        poll_count = 0
         while time.monotonic() < deadline:
             time.sleep(poll_interval)
+            poll_count += 1
             resp = client.post(
                 TWO_CAPTCHA_GET_RESULT_URL,
                 json={"clientKey": api_key, "taskId": task_id},
@@ -69,6 +79,13 @@ def solve_image_captcha(
                     f"{data.get('errorDescription')}"
                 )
             if data["status"] == "ready":
+                logger.info(
+                    f"2captcha: task {task_id} solved after {poll_count} poll(s)"
+                )
                 return data["solution"]["text"]
+            logger.info(
+                f"2captcha: task {task_id} still processing "
+                f"(poll {poll_count}, {deadline - time.monotonic():.0f}s left)"
+            )
 
     raise AuthError("2captcha did not return a result within max_wait")

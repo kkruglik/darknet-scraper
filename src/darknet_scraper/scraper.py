@@ -142,18 +142,25 @@ class Scraper:
             raise RuntimeError("Scraper must be used within a 'with' context manager.")
 
         for attempt in range(1, self.retries + 1):
+            logger.info(f"{method} {url} (attempt {attempt}/{self.retries})")
             try:
                 response = self.client.request(method, url, **kwargs)
-            except httpx.RequestError:
+            except httpx.RequestError as exc:
                 if attempt == self.retries:
+                    logger.error(
+                        f"{type(exc).__name__} on final attempt {attempt}/{self.retries} "
+                        f"for {method} {url}: {exc}"
+                    )
                     raise
                 wait = self.backoff_base * (2 ** (attempt - 1))
                 logger.warning(
-                    f"Network error on attempt {attempt}/{self.retries} for {url}, "
-                    f"waiting {wait}s"
+                    f"{type(exc).__name__} on attempt {attempt}/{self.retries} for "
+                    f"{method} {url}: {exc}, waiting {wait}s"
                 )
                 time.sleep(wait)
                 continue
+
+            logger.info(f"{method} {url} -> {response.status_code}")
 
             if response.status_code == 429 and attempt < self.retries:
                 wait = self.backoff_base * (2 ** (attempt - 1))
@@ -370,13 +377,20 @@ class Scraper:
         cookie, and follow the page's own location.href. Returns the final
         (non-challenge) page's HTML.
         """
-        for _ in range(max_hops):
+        logger.info(f"TCK bootstrap: starting at {url}")
+        for hop in range(1, max_hops + 1):
             resp = self.request("GET", url, follow_redirects=True)
             resp.raise_for_status()
             html = resp.text
 
             if not self.is_tck_challenge_page(html):
+                logger.info(
+                    f"TCK bootstrap: no challenge on this page, treating as done "
+                    f"({hop - 1} challenge hop(s) solved)"
+                )
                 return html
+
+            logger.info(f"TCK bootstrap: challenge hop {hop}/{max_hops} at {url}")
 
             vars_match = _TCK_VARS_RE.search(html)
             if not vars_match:
@@ -391,6 +405,7 @@ class Scraper:
                 "TCK", _decrypt_tck(key_hex, iv_hex, ciphertext_hex)
             )
             url = urljoin(url, href_match.group(1))
+            logger.info(f"TCK bootstrap: hop {hop} solved, following redirect to {url}")
 
         raise AuthError("TCK bootstrap did not resolve within max_hops")
 
@@ -410,10 +425,16 @@ class Scraper:
             max_captcha_retries,
         )
 
+        logger.info(f"auth(): starting login flow at {captcha_url}")
         html = self.solve_tck_bootstrap(captcha_url)
+        logger.info("auth(): TCK bootstrap done, parsing image captcha form")
 
         for attempt in range(1, max_captcha_retries + 1):
             form = self.parse_captcha_form(html)
+            logger.info(
+                f"auth(): image captcha form parsed (userId={form.user_id}), "
+                f"solving via 2captcha"
+            )
             answer = solve_image_captcha(
                 captcha_key,
                 form.image_b64,
@@ -439,12 +460,15 @@ class Scraper:
             html = resp.text
 
             if "form-captcha" not in html:
+                logger.info(f"auth(): image captcha accepted, landed on {resp.url}")
                 break
+            logger.warning(f"auth(): image captcha attempt {attempt} rejected, retrying")
             if attempt == max_captcha_retries:
                 raise AuthError("Image captcha retries exhausted")
 
         login_form = self.parse_login_form(html)
         action_url = urljoin(str(resp.url), login_form["action"])
+        logger.info(f"auth(): login form parsed, will post credentials to {action_url}")
 
         for attempt in range(1, max_captcha_retries + 1):
             cyrillic_answer = solve_image_captcha(
@@ -477,7 +501,9 @@ class Scraper:
             if not BeautifulSoup(html, "html.parser").select_one(
                 "input[name='captcha']"
             ):
+                logger.info(f"auth(): login accepted, landed on {resp.url}")
                 break
+            logger.warning(f"auth(): login captcha attempt {attempt} rejected, retrying")
             if attempt == max_captcha_retries:
                 raise AuthError(
                     "Login captcha retries exhausted or credentials rejected"
@@ -487,6 +513,7 @@ class Scraper:
 
         parts = urlsplit(str(resp.url))
         self.base_url = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
+        logger.info(f"auth(): login flow complete, main site resolved to {self.base_url}")
         return self.base_url
 
     def reauth(self) -> str:
