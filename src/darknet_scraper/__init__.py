@@ -387,9 +387,14 @@ def main() -> None:
     file_handler = RotatingFileHandler(
         log_dir / "darknet-scraper.log", maxBytes=10 * 1024 * 1024, backupCount=5
     )
+    file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(formatter)
 
+    # WARNING-only on the console: per-request INFO logs would otherwise
+    # interleave with tqdm's \r-redrawn progress bars on the same stream and
+    # corrupt both. Full detail still goes to the file.
     stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.WARNING)
     stream_handler.setFormatter(formatter)
 
     logging.basicConfig(level=logging.INFO, handlers=[file_handler, stream_handler])
