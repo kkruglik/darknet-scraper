@@ -1,6 +1,7 @@
 services:
   scraper:
     build: .
+    restart: on-failure
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
