@@ -62,6 +62,30 @@ def log_progress(message: str) -> None:
     logger.info(message)
 
 
+def load_with_reauth(s: Scraper, url: str) -> str | None:
+    """Load a page, re-authenticating once if the session has expired.
+
+    reauth() can resolve to a different mirror, so the retry swaps the URL's
+    host for the fresh s.base_url instead of hitting the stale one. A page
+    that is still rejected right after a fresh login is treated as
+    page-specific (e.g. a removed shop redirecting away) and returns None,
+    instead of raising and taking the whole run down.
+    """
+    try:
+        return s.load_url(url)
+    except SessionExpired as exc:
+        logger.warning(f"Session expired ({exc}), re-authenticating")
+        s.reauth()
+
+    parts = urlsplit(url)
+    url = urlunsplit(parts._replace(netloc=urlsplit(s.base_url).netloc))
+    try:
+        return s.load_url(url)
+    except SessionExpired as exc:
+        logger.error(f"Still rejected right after re-auth, skipping: {exc}")
+        return None
+
+
 def scrape_all_shops(
     s: Scraper, start_url: str, cache_dir: Path, output_file: Path
 ) -> None:
@@ -80,12 +104,7 @@ def scrape_all_shops(
         for i in cache:
             shop_ids.extend(cache[i]["result"])
 
-    try:
-        page_html = s.load_url(start_url)
-    except SessionExpired:
-        logger.warning("Session expired, re-authenticating")
-        s.reauth()
-        page_html = s.load_url(start_url)
+    page_html = load_with_reauth(s, start_url)
     if not page_html:
         logger.error(f"Failed to load first page {start_url}, stopping discovery")
         return
@@ -109,12 +128,7 @@ def scrape_all_shops(
         if cache_filename in cache:
             continue
 
-        try:
-            page_html = s.load_url(page_url)
-        except SessionExpired:
-            logger.warning("Session expired, re-authenticating")
-            s.reauth()
-            page_html = s.load_url(page_url)
+        page_html = load_with_reauth(s, page_url)
         if not page_html:
             tqdm.write(f"Failed to load page {page_num}, stopping discovery")
             break
@@ -172,14 +186,8 @@ def scrape_all_reviews(
         if shop_csv.exists():
             continue
 
+        page_html = load_with_reauth(s, s.build_url("shop_comments", shop_id))
         comments_url = s.build_url("shop_comments", shop_id)
-        try:
-            page_html = s.load_url(comments_url)
-        except SessionExpired:
-            logger.warning("Session expired, re-authenticating")
-            s.reauth()
-            comments_url = s.build_url("shop_comments", shop_id)
-            page_html = s.load_url(comments_url)
         if not page_html:
             log_progress(
                 f"[{shop_num}/{total_shops}] Failed to load first review page for "
@@ -209,14 +217,9 @@ def scrape_all_reviews(
                 page_pbar.set_postfix(reviews=len(shop_reviews))
                 continue
 
-            try:
-                page_html = s.load_url(page_url)
-            except SessionExpired:
-                logger.warning("Session expired, re-authenticating")
-                s.reauth()
-                comments_url = s.build_url("shop_comments", shop_id)
-                page_url = f"{comments_url}?p={page_num}"
-                page_html = s.load_url(page_url)
+            page_html = load_with_reauth(s, page_url)
+            comments_url = s.build_url("shop_comments", shop_id)
+            page_url = f"{comments_url}?p={page_num}"
             if not page_html:
                 log_progress(
                     f"[{shop_num}/{total_shops}] Failed to load review page "
@@ -295,14 +298,8 @@ def scrape_all_products(
         if shop_csv.exists():
             continue
 
+        page_html = load_with_reauth(s, s.build_url("shop_catalog", shop_id))
         shop_url = s.build_url("shop_catalog", shop_id)
-        try:
-            page_html = s.load_url(shop_url)
-        except SessionExpired:
-            logger.warning("Session expired, re-authenticating")
-            s.reauth()
-            shop_url = s.build_url("shop_catalog", shop_id)
-            page_html = s.load_url(shop_url)
         if not page_html:
             log_progress(
                 f"[{shop_num}/{total_shops}] Failed to load first product page for "
@@ -333,14 +330,9 @@ def scrape_all_products(
                 page_pbar.set_postfix(products=len(shop_products))
                 continue
 
-            try:
-                page_html = s.load_url(page_url)
-            except SessionExpired:
-                logger.warning("Session expired, re-authenticating")
-                s.reauth()
-                shop_url = s.build_url("shop_catalog", shop_id)
-                page_url = f"{shop_url}?p={page_num}"
-                page_html = s.load_url(page_url)
+            page_html = load_with_reauth(s, page_url)
+            shop_url = s.build_url("shop_catalog", shop_id)
+            page_url = f"{shop_url}?p={page_num}"
             if not page_html:
                 log_progress(
                     f"[{shop_num}/{total_shops}] Failed to load product page "

@@ -67,7 +67,12 @@ class ImageCaptchaForm:
 
 
 class SessionExpired(Exception):
-    """Raised when a request comes back 403 — the session needs a fresh auth()."""
+    """Raised when a request comes back 403 or 3xx — the session needs a fresh auth().
+
+    The site answers an expired session (stale TCK cookie, logged out,
+    rotated mirror) with a redirect to its challenge/login flow instead of
+    the page, so a redirect on a plain page GET means the same thing as 403.
+    """
 
 
 class Scraper:
@@ -178,6 +183,11 @@ class Scraper:
     def load_url(self, url: str) -> str | None:
         try:
             response = self.request("GET", url)
+            if response.is_redirect:
+                location = response.headers.get("Location")
+                raise SessionExpired(
+                    f"{response.status_code} for {url} -> {location}, session needs re-auth"
+                )
             response.raise_for_status()
             return response.text
         except httpx.RequestError as exc:
