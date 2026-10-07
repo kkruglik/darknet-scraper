@@ -123,7 +123,12 @@ class Scraper:
 
     @staticmethod
     def hash_url(url: str) -> str:
-        return hashlib.md5(url.encode()).hexdigest()
+        """Cache key for a page URL, independent of the mirror host.
+
+        Mirrors rotate between runs and on reauth(), so hashing the absolute
+        URL would orphan every cached page whenever base_url changes.
+        """
+        return hashlib.md5(Scraper.to_relative(url).encode()).hexdigest()
 
     @staticmethod
     def to_relative(url: str) -> str:

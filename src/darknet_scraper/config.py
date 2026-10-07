@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
 
 class AuthConfig(BaseModel):
@@ -8,7 +8,7 @@ class AuthConfig(BaseModel):
     password: SecretStr
     captcha_key: SecretStr
     captcha_url: str
-    max_captcha_retries: int = 5
+    max_captcha_retries: int = Field(default=5, ge=1)
 
 
 class ShopsConfig(BaseModel):

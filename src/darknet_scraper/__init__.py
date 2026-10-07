@@ -86,12 +86,48 @@ def load_with_reauth(s: Scraper, url: str) -> str | None:
         return None
 
 
+def migrate_cache_keys(s: Scraper, cache_dir: Path) -> None:
+    """Rename cache files keyed by an older hash_url() scheme to the current one.
+
+    Each entry stores the URL it was scraped from, so its current key can be
+    recomputed. When the same page was cached under several mirrors, they all
+    map to one key: the first one renamed wins and the rest are removed as
+    duplicates.
+    """
+    renamed = 0
+    duplicates = 0
+    for path in cache_dir.rglob("*.json"):
+        with open(path) as f:
+            page_url = json.load(f).get("url")
+        if not page_url:
+            continue
+
+        target = path.with_name(f"{s.hash_url(page_url)}.json")
+        if target == path:
+            continue
+        if target.exists():
+            path.unlink()
+            duplicates += 1
+        else:
+            path.rename(target)
+            renamed += 1
+
+    if renamed or duplicates:
+        logger.info(
+            f"Migrated cache keys in {cache_dir}: renamed={renamed}, "
+            f"removed duplicates={duplicates}"
+        )
+
+
 def scrape_all_shops(
     s: Scraper, start_url: str, cache_dir: Path, output_file: Path
 ) -> None:
+    started_at = time.monotonic()
+    logger.info(f"Starting shop discovery: cache={cache_dir}, output={output_file}")
     shop_ids = []
     cache = {}
     cache_dir.mkdir(parents=True, exist_ok=True)
+    migrate_cache_keys(s, cache_dir)
 
     for i in cache_dir.rglob("*.json"):
         with open(i) as f:
@@ -103,7 +139,9 @@ def scrape_all_shops(
     else:
         for i in cache:
             shop_ids.extend(cache[i]["result"])
+        logger.info(f"Loaded {len(cache)} cached shop pages with {len(shop_ids)} shop IDs")
 
+    logger.info("Loading first catalog page to determine pagination")
     page_html = load_with_reauth(s, start_url)
     if not page_html:
         logger.error(f"Failed to load first page {start_url}, stopping discovery")
@@ -126,15 +164,20 @@ def scrape_all_shops(
         cache_filename = f"{url_hash}.json"
 
         if cache_filename in cache:
+            logger.info(f"Shop page {page_num}/{last_page}: using cache, skipping request")
             continue
 
+        logger.info(f"Loading shop page {page_num}/{last_page}")
         page_html = load_with_reauth(s, page_url)
         if not page_html:
             tqdm.write(f"Failed to load page {page_num}, stopping discovery")
+            logger.error(f"Failed to load shop page {page_num}/{last_page}, stopping discovery")
             break
 
         soup = BeautifulSoup(page_html, "html.parser")
         found = s.scrape_shops_from_main(soup)
+        if not found:
+            logger.warning(f"Shop page {page_num}/{last_page}: no shop IDs found")
 
         entry = {
             "url": page_url,
@@ -149,6 +192,10 @@ def scrape_all_shops(
 
         shop_ids.extend(found)
         pbar.set_postfix(shops=len(shop_ids))
+        logger.info(
+            f"Shop page {page_num}/{last_page}: found {len(found)} shop IDs, "
+            f"total={len(shop_ids)}, cached to {cache_dir / cache_filename}"
+        )
 
         time.sleep(s.request_delay)
 
@@ -159,48 +206,73 @@ def scrape_all_shops(
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"shop_id": shop_ids}).to_csv(output_file, index=False)
+    logger.info(
+        f"Saved {len(shop_ids)} shop IDs to {output_file} "
+        f"in {time.monotonic() - started_at:.1f}s"
+    )
 
 
 def scrape_all_reviews(
     s: Scraper, input_file: Path, cache_dir: Path, output_dir: Path
 ) -> None:
+    started_at = time.monotonic()
+    logger.info(
+        f"Starting review scraping: input={input_file}, cache={cache_dir}, output={output_dir}"
+    )
     if not input_file.exists():
+        logger.error(f"Cannot scrape reviews: shop file not found: {input_file}")
         raise RuntimeError("Shop file not found")
 
     shop_ids = pd.read_csv(input_file)["shop_id"].to_list()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    migrate_cache_keys(s, cache_dir)
     cached_pages = {p.name for p in cache_dir.rglob("*.json")}
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if not cached_pages:
         logger.info("No review cache data found, starting from scratch")
+    else:
+        logger.info(f"Found {len(cached_pages)} cached review pages")
 
     total_reviews = 0
+    written_reviews = 0
     scraped_shops = 0
+    skipped_shops = 0
+    incomplete_shops = 0
     total_shops = len(shop_ids)
+    logger.info(f"Loaded {total_shops} shops for review scraping")
     shop_pbar = tqdm(shop_ids, desc="Shops", unit="shop")
     for shop_num, shop_id in enumerate(shop_pbar, start=1):
         shop_pbar.set_postfix(reviews=total_reviews)
         shop_csv = output_dir / f"{shop_id}.csv"
         if shop_csv.exists():
+            skipped_shops += 1
+            logger.info(
+                f"[{shop_num}/{total_shops}] Shop {shop_id}: skipping existing CSV {shop_csv}"
+            )
             continue
 
+        log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: starting review collection")
         page_html = load_with_reauth(s, s.build_url("shop_comments", shop_id))
         comments_url = s.build_url("shop_comments", shop_id)
         if not page_html:
             log_progress(
                 f"[{shop_num}/{total_shops}] Failed to load first review page for "
-                f"{shop_id}, stopping"
+                f"{shop_id}, skipping shop"
             )
+            logger.error(f"Shop {shop_id}: first review page unavailable, CSV not written")
+            incomplete_shops += 1
             continue
 
         soup = BeautifulSoup(page_html, "html.parser")
         last_page = s.get_last_page_number(soup)
         if not last_page:
             log_progress(f"[{shop_num}/{total_shops}] Could not determine last page for {shop_id}")
+            logger.warning(f"Shop {shop_id}: review pagination unavailable, falling back to one page")
             last_page = 1
 
+        logger.info(f"Shop {shop_id}: found {last_page} review pages")
         shop_reviews = []
         complete = True
         page_pbar = tqdm(
@@ -213,23 +285,32 @@ def scrape_all_reviews(
 
             if cache_filename in cached_pages:
                 with open(cache_dir / cache_filename) as f:
-                    shop_reviews.extend(json.load(f)["result"])
+                    cached_reviews = json.load(f)["result"]
+                shop_reviews.extend(cached_reviews)
+                logger.info(
+                    f"Shop {shop_id}, review page {page_num}/{last_page}: "
+                    f"loaded {len(cached_reviews)} reviews from cache"
+                )
                 page_pbar.set_postfix(reviews=len(shop_reviews))
                 continue
 
+            logger.info(f"Shop {shop_id}: loading review page {page_num}/{last_page}")
             page_html = load_with_reauth(s, page_url)
             comments_url = s.build_url("shop_comments", shop_id)
             page_url = f"{comments_url}?p={page_num}"
             if not page_html:
                 log_progress(
                     f"[{shop_num}/{total_shops}] Failed to load review page "
-                    f"{page_num} for {shop_id}, stopping"
+                    f"{page_num} for {shop_id}, stopping this shop"
                 )
+                logger.error(f"Shop {shop_id}: review page {page_num}/{last_page} unavailable")
                 complete = False
                 break
 
             soup = BeautifulSoup(page_html, "html.parser")
             reviews = s.scrape_shop_reviews(soup)
+            if not reviews:
+                logger.warning(f"Shop {shop_id}, review page {page_num}/{last_page}: no reviews found")
             for review in reviews:
                 review["shop_id"] = shop_id
 
@@ -247,6 +328,11 @@ def scrape_all_reviews(
 
             shop_reviews.extend(reviews)
             page_pbar.set_postfix(reviews=len(shop_reviews))
+            logger.info(
+                f"Shop {shop_id}, review page {page_num}/{last_page}: "
+                f"found {len(reviews)} reviews, total={len(shop_reviews)}, "
+                f"cached to {cache_dir / cache_filename}"
+            )
 
             time.sleep(s.request_delay)
 
@@ -257,19 +343,23 @@ def scrape_all_reviews(
         # Only a fully paged shop gets a CSV, so an interrupted one is retried
         # on the next run (cheaply, from the page cache) instead of looking done.
         if not complete:
+            incomplete_shops += 1
             log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: incomplete, CSV not written")
             continue
 
         pd.DataFrame(shop_reviews, columns=REVIEW_COLUMNS).to_csv(shop_csv, index=False)
         scraped_shops += 1
+        written_reviews += len(shop_reviews)
         log_progress(
             f"[{shop_num}/{total_shops}] Shop {shop_id}: {len(shop_reviews)} reviews -> {shop_csv}"
         )
 
     shop_pbar.close()
     logger.info(
-        f"Review scraping finished: {total_reviews} reviews written across "
-        f"{scraped_shops} shop files in {output_dir}"
+        f"Review scraping finished: {written_reviews} reviews written across "
+        f"{scraped_shops} shop files in {output_dir}; collected={total_reviews}, "
+        f"skipped={skipped_shops}, incomplete={incomplete_shops}, "
+        f"elapsed={time.monotonic() - started_at:.1f}s"
     )
 
 
@@ -281,6 +371,7 @@ def scrape_all_products(
 
     shop_ids = pd.read_csv(input_file)["shop_id"].to_list()
     cache_dir.mkdir(parents=True, exist_ok=True)
+    migrate_cache_keys(s, cache_dir)
     cached_pages = {p.name for p in cache_dir.rglob("*.json")}
 
     output_dir.mkdir(parents=True, exist_ok=True)
