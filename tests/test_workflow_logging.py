@@ -6,10 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx2 as httpx
 import pandas as pd
 
-from darknet_scraper import migrate_cache_keys, scrape_all_reviews, scrape_all_shops
-from darknet_scraper.scraper import Scraper
+from darknet_scraper import load_with_reauth, migrate_cache_keys, scrape_all_reviews, scrape_all_shops
+from darknet_scraper.scraper import RateLimited, Scraper
+from darknet_scraper.tor_client import TorScraper
 
 
 class WorkflowLoggingTests(unittest.TestCase):
@@ -195,43 +197,181 @@ class RateLimitTests(unittest.TestCase):
 
     def respond(self, *statuses, headers=None):
         self.scraper.client.request.side_effect = [
-            Mock(status_code=status, headers=headers or {}) for status in statuses
+            status if isinstance(status, Exception) else Mock(status_code=status, headers=headers or {})
+            for status in statuses
         ]
+
+    def request(self, url="https://example.test/page", **kwargs):
+        with self.assertLogs("darknet_scraper", level="INFO"):
+            return self.scraper.request("GET", url, **kwargs)
+
+    def waits(self):
+        return [c.args[0] for c in self.sleep.call_args_list]
 
     def test_429_backs_off_and_raises_delay_then_recovers(self):
         self.respond(429, 429, 200)
 
-        response = self.scraper.request("GET", "https://example.test/page")
+        response = self.request()
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [3.0, 6.0])
+        self.assertEqual(self.waits(), [3.0, 6.0])
         self.assertAlmostEqual(self.scraper.request_delay, 4.0 * 0.95)
 
-    def test_retry_after_header_is_honoured_and_capped(self):
-        self.respond(429, 429, 200, headers={"Retry-After": "900"})
-        self.scraper.max_backoff = 120.0
+    def test_retry_after_is_used_as_is_below_the_ceiling(self):
+        self.respond(429, 200, headers={"Retry-After": "7"})
 
-        self.scraper.request("GET", "https://example.test/page")
+        self.request()
 
-        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [120.0, 120.0])
+        self.assertEqual(self.waits(), [7.0])
+
+    def test_retry_after_above_max_backoff_is_still_honoured(self):
+        self.scraper.max_backoff = 60.0
+        self.respond(429, 200, headers={"Retry-After": "300"})
+
+        self.request()
+
+        self.assertEqual(self.waits(), [300.0])
+
+    def test_retry_after_is_capped_at_max_retry_after(self):
+        self.scraper.max_retry_after = 120.0
+        self.respond(429, 200, headers={"Retry-After": "900"})
+
+        self.request()
+
+        self.assertEqual(self.waits(), [120.0])
+
+    def test_retry_after_zero_still_waits(self):
+        self.respond(429, 200, headers={"Retry-After": "0"})
+
+        self.request()
+
+        self.assertEqual(self.waits(), [1.0])
+
+    def test_non_numeric_retry_after_falls_back_to_backoff(self):
+        for value in ["Wed, 21 Oct 2026 07:28:00 GMT", "\u00b2", "nan"]:
+            with self.subTest(value=value):
+                self.sleep.reset_mock()
+                self.respond(429, 200, headers={"Retry-After": value})
+
+                self.request()
+
+                self.assertEqual(self.waits(), [3.0])
 
     def test_gives_up_after_rate_limit_retries(self):
         self.scraper.rate_limit_retries = 2
         self.respond(429, 429, 429)
 
-        with self.assertLogs("darknet_scraper", level="ERROR"):
-            response = self.scraper.request("GET", "https://example.test/page")
+        response = self.request()
 
         self.assertEqual(response.status_code, 429)
         self.assertEqual(self.scraper.client.request.call_count, 3)
+        self.assertEqual(self.waits(), [3.0, 6.0])
+        self.assertEqual(self.scraper.request_delay, 8.0)
+
+    def test_per_call_override_disables_429_retries(self):
+        self.respond(429)
+
+        response = self.request(rate_limit_retries=0)
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(self.scraper.client.request.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_repeatedly_exhausted_budget_raises_rate_limited(self):
+        self.scraper.rate_limit_retries = 0
+        self.scraper.rate_limit_strikes = 3
+        self.respond(429, 429, 429)
+
+        self.assertEqual(self.request("https://example.test/a").status_code, 429)
+        self.assertEqual(self.request("https://example.test/b").status_code, 429)
+        with self.assertRaises(RateLimited):
+            self.request("https://example.test/c")
+
+    def test_any_other_response_resets_the_strike_count(self):
+        self.scraper.rate_limit_retries = 0
+        self.scraper.rate_limit_strikes = 2
+        self.respond(429, 200, 429)
+
+        self.request("https://example.test/a")
+        self.request("https://example.test/b")
+
+        self.assertEqual(self.request("https://example.test/c").status_code, 429)
+
+    def test_delay_is_capped_at_max_delay(self):
+        self.scraper.max_delay = 5.0
+        self.respond(*[429] * 4, 200)
+
+        self.request()
+
+        self.assertEqual(self.scraper.request_delay, 5.0 * 0.95)
 
     def test_delay_never_drops_below_configured_minimum(self):
         self.respond(200, 200)
 
-        self.scraper.request("GET", "https://example.test/a")
-        self.scraper.request("GET", "https://example.test/b")
+        self.request("https://example.test/a")
+        self.request("https://example.test/b")
 
         self.assertEqual(self.scraper.request_delay, 1.0)
+
+    def test_max_delay_is_never_below_configured_delay(self):
+        scraper = Scraper("https://example.test", {}, {}, request_delay=60.0, max_delay=30.0)
+
+        scraper._slow_down()
+
+        self.assertEqual(scraper.request_delay, 60.0)
+
+    def test_network_errors_exhaust_their_own_budget(self):
+        self.scraper.retries = 3
+        error = httpx.ConnectError("boom")
+        self.respond(error, error, error)
+
+        with self.assertRaises(httpx.ConnectError):
+            self.request()
+
+        self.assertEqual(self.waits(), [3.0, 6.0])
+
+    def test_received_response_resets_network_failures(self):
+        self.scraper.retries = 2
+        error = httpx.ReadTimeout("slow")
+        self.respond(error, 429, error, 200)
+
+        response = self.request()
+
+        self.assertEqual(response.status_code, 200)
+
+    def test_tor_scraper_maps_positional_args(self):
+        scraper = TorScraper("https://example.test", {}, {})
+
+        self.assertEqual(
+            (scraper.timeout, scraper.request_delay, scraper.retries, scraper.backoff_base),
+            (60, 3.0, 5, 3.0),
+        )
+        self.assertEqual(scraper.rate_limit_retries, 10)
+
+
+class LoadWithReauthTests(unittest.TestCase):
+    def setUp(self):
+        self.scraper = Mock(spec=Scraper)
+        self.scraper.base_url = "https://mirror-b.test"
+        self.scraper.rate_limit_cooldown = 600
+        self.sleep = self.enterContext(patch("darknet_scraper.time.sleep"))
+
+    def test_rate_limited_session_pauses_reauths_and_retries(self):
+        self.scraper.load_url.side_effect = [RateLimited("blocked"), "<html></html>"]
+
+        with self.assertLogs("darknet_scraper", level="WARNING"):
+            html = load_with_reauth(self.scraper, "https://mirror-a.test/shop/comments/1/")
+
+        self.assertEqual(html, "<html></html>")
+        self.sleep.assert_called_once_with(600)
+        self.scraper.reauth.assert_called_once()
+        self.scraper.load_url.assert_called_with("https://mirror-b.test/shop/comments/1/")
+
+    def test_still_rate_limited_after_reauth_propagates(self):
+        self.scraper.load_url.side_effect = [RateLimited("blocked"), RateLimited("blocked")]
+
+        with self.assertLogs("darknet_scraper", level="WARNING"), self.assertRaises(RateLimited):
+            load_with_reauth(self.scraper, "https://mirror-a.test/shop/comments/1/")
 
 
 if __name__ == "__main__":

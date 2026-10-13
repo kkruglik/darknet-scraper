@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass
@@ -75,6 +76,16 @@ class SessionExpired(Exception):
     """
 
 
+class RateLimited(Exception):
+    """Raised when the site keeps answering 429 and retrying won't help.
+
+    Either several requests in a row used up their whole 429 budget (the
+    session looks blocked, so grinding through more pages would just fail
+    every shop), or a one-shot login POST was rate limited (a captcha answer
+    can't be replayed later). Callers should pause and log in again.
+    """
+
+
 class Scraper:
     def __init__(
         self,
@@ -88,6 +99,9 @@ class Scraper:
         rate_limit_retries: int = 10,
         max_backoff: float = 60.0,
         max_delay: float = 30.0,
+        max_retry_after: float = 600.0,
+        rate_limit_strikes: int = 3,
+        rate_limit_cooldown: float = 600.0,
     ):
         self.base_url = base_url
         self.client = None
@@ -96,11 +110,15 @@ class Scraper:
         self.timeout = timeout
         self.request_delay = request_delay
         self.min_delay = request_delay
-        self.max_delay = max_delay
+        self.max_delay = max(max_delay, request_delay)
         self.retries = retries
         self.backoff_base = backoff_base
         self.rate_limit_retries = rate_limit_retries
         self.max_backoff = max_backoff
+        self.max_retry_after = max_retry_after
+        self.rate_limit_strikes = rate_limit_strikes
+        self.rate_limit_cooldown = rate_limit_cooldown
+        self._exhausted_in_a_row = 0
 
     def build_url(
         self,
@@ -142,15 +160,27 @@ class Scraper:
         parts = urlsplit(url)
         return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
 
-    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        rate_limit_retries: int | None = None,
+        **kwargs,
+    ) -> httpx.Response:
         """Make a request, retrying on network errors and 429s with backoff.
 
-        Network errors and 429s have separate retry budgets: self.retries
-        for the former, self.rate_limit_retries for the latter. A 429 is the
-        site asking us to slow down, not a broken circuit, so it gets more
-        and longer waits (Retry-After if sent, else exponential backoff
-        capped at self.max_backoff) instead of giving up after ~45s and
-        abandoning the whole shop.
+        Network errors and 429s have separate budgets. self.retries is the
+        total number of attempts allowed for network errors, counted since
+        the last response actually received (a 429 in between shows the
+        circuit works). rate_limit_retries (default self.rate_limit_retries)
+        is the number of extra attempts after a 429. A 429 is the site
+        asking us to slow down, not a broken circuit, so it gets more and
+        longer waits: Retry-After if sent (up to self.max_retry_after), else
+        exponential backoff capped at self.max_backoff.
+
+        Pass rate_limit_retries=0 for one-shot POSTs (captcha, login) whose
+        form would expire before a late replay.
 
         Every 429 also raises self.request_delay (the pause callers sleep
         between pages), and every other response lowers it back toward
@@ -159,12 +189,18 @@ class Scraper:
 
         Returns the raw response without checking its status otherwise —
         callers decide what counts as success via response.raise_for_status().
-        Re-raises the last httpx.RequestError once retries are exhausted;
-        a still-429 response after exhausting retries is returned as-is.
+        Re-raises the last httpx.RequestError once retries are exhausted.
+        A still-429 response after exhausting the 429 budget is returned
+        as-is, unless self.rate_limit_strikes requests in a row ended that
+        way, in which case RateLimited is raised: the session looks blocked,
+        and failing every remaining shop one 429 budget at a time would
+        waste hours.
         """
         if not self.client:
             raise RuntimeError("Scraper must be used within a 'with' context manager.")
 
+        if rate_limit_retries is None:
+            rate_limit_retries = self.rate_limit_retries
         network_failures = 0
         rate_limited = 0
         attempt = 0
@@ -190,31 +226,44 @@ class Scraper:
                 continue
 
             logger.info(f"{method} {url} -> {response.status_code}")
+            network_failures = 0
 
             if response.status_code != 429:
+                self._exhausted_in_a_row = 0
                 self._speed_up()
                 return response
 
             rate_limited += 1
             self._slow_down()
-            if rate_limited > self.rate_limit_retries:
+            if rate_limited > rate_limit_retries:
+                self._exhausted_in_a_row += 1
                 logger.error(
-                    f"Still rate limited (429) after {self.rate_limit_retries} "
-                    f"retries for {method} {url}, giving up"
+                    f"Still rate limited (429) after {rate_limit_retries} retries "
+                    f"for {method} {url}, giving up "
+                    f"({self._exhausted_in_a_row}/{self.rate_limit_strikes} in a row)"
                 )
+                if self._exhausted_in_a_row >= self.rate_limit_strikes:
+                    raise RateLimited(
+                        f"{self._exhausted_in_a_row} requests in a row stayed "
+                        f"rate limited, last: {method} {url}"
+                    )
                 return response
 
             wait = self._rate_limit_wait(response, rate_limited)
             logger.warning(
-                f"Rate limited (429) {rate_limited}/{self.rate_limit_retries}, "
+                f"Rate limited (429) {rate_limited}/{rate_limit_retries}, "
                 f"waiting {wait:.0f}s, request_delay now {self.request_delay:.1f}s"
             )
             time.sleep(wait)
 
     def _rate_limit_wait(self, response: httpx.Response, rate_limited: int) -> float:
-        retry_after = response.headers.get("Retry-After", "")
-        if retry_after.isdigit():
-            return min(float(retry_after), self.max_backoff)
+        # HTTP-date values (and anything else non-numeric) fall back to backoff.
+        try:
+            retry_after = float(response.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after = None
+        if retry_after is not None and math.isfinite(retry_after):
+            return min(max(retry_after, 1.0), self.max_retry_after)
         return min(self.backoff_base * (2 ** (rate_limited - 1)), self.max_backoff)
 
     def _slow_down(self) -> None:
@@ -508,7 +557,9 @@ class Scraper:
                     "answer": answer.upper(),
                 },
                 follow_redirects=True,
+                rate_limit_retries=0,
             )
+            self._raise_if_rate_limited(resp, "image captcha POST")
             resp.raise_for_status()
             html = resp.text
 
@@ -545,7 +596,9 @@ class Scraper:
                     "captcha": cyrillic_answer.upper(),
                 },
                 follow_redirects=True,
+                rate_limit_retries=0,
             )
+            self._raise_if_rate_limited(resp, "login POST")
             resp.raise_for_status()
             html = resp.text
 
@@ -568,6 +621,13 @@ class Scraper:
         self.base_url = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
         logger.info(f"auth(): login flow complete, main site resolved to {self.base_url}")
         return self.base_url
+
+    @staticmethod
+    def _raise_if_rate_limited(resp: httpx.Response, what: str) -> None:
+        # The captcha in a login form is one-shot, so a 429 here can't be
+        # retried later with the same answer — the whole login has to restart.
+        if resp.status_code == 429:
+            raise RateLimited(f"{what} was rate limited (429), login must restart")
 
     def reauth(self) -> str:
         """Re-run auth() with the same credentials used last time.
