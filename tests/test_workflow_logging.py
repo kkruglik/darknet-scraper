@@ -187,5 +187,52 @@ class CacheKeyTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.cache_dir.glob("*.json")), names)
 
 
+class RateLimitTests(unittest.TestCase):
+    def setUp(self):
+        self.scraper = Scraper("https://example.test", {}, {}, request_delay=1.0, backoff_base=3.0)
+        self.scraper.client = Mock()
+        self.sleep = self.enterContext(patch("darknet_scraper.scraper.time.sleep"))
+
+    def respond(self, *statuses, headers=None):
+        self.scraper.client.request.side_effect = [
+            Mock(status_code=status, headers=headers or {}) for status in statuses
+        ]
+
+    def test_429_backs_off_and_raises_delay_then_recovers(self):
+        self.respond(429, 429, 200)
+
+        response = self.scraper.request("GET", "https://example.test/page")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [3.0, 6.0])
+        self.assertAlmostEqual(self.scraper.request_delay, 4.0 * 0.95)
+
+    def test_retry_after_header_is_honoured_and_capped(self):
+        self.respond(429, 429, 200, headers={"Retry-After": "900"})
+        self.scraper.max_backoff = 120.0
+
+        self.scraper.request("GET", "https://example.test/page")
+
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [120.0, 120.0])
+
+    def test_gives_up_after_rate_limit_retries(self):
+        self.scraper.rate_limit_retries = 2
+        self.respond(429, 429, 429)
+
+        with self.assertLogs("darknet_scraper", level="ERROR"):
+            response = self.scraper.request("GET", "https://example.test/page")
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(self.scraper.client.request.call_count, 3)
+
+    def test_delay_never_drops_below_configured_minimum(self):
+        self.respond(200, 200)
+
+        self.scraper.request("GET", "https://example.test/a")
+        self.scraper.request("GET", "https://example.test/b")
+
+        self.assertEqual(self.scraper.request_delay, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

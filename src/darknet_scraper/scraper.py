@@ -85,6 +85,9 @@ class Scraper:
         request_delay: float = 2.0,
         retries: int = 3,
         backoff_base: float = 5.0,
+        rate_limit_retries: int = 10,
+        max_backoff: float = 60.0,
+        max_delay: float = 30.0,
     ):
         self.base_url = base_url
         self.client = None
@@ -92,8 +95,12 @@ class Scraper:
         self.cookies = cookies
         self.timeout = timeout
         self.request_delay = request_delay
+        self.min_delay = request_delay
+        self.max_delay = max_delay
         self.retries = retries
         self.backoff_base = backoff_base
+        self.rate_limit_retries = rate_limit_retries
+        self.max_backoff = max_backoff
 
     def build_url(
         self,
@@ -138,10 +145,17 @@ class Scraper:
     def request(self, method: str, url: str, **kwargs) -> httpx.Response:
         """Make a request, retrying on network errors and 429s with backoff.
 
-        Uses self.retries/self.backoff_base — set once per instance (e.g.
-        TorScraper defaults these higher, since Tor circuits flake more
-        often than a direct connection) rather than per-call, since nothing
-        in this codebase ever needs a one-off override.
+        Network errors and 429s have separate retry budgets: self.retries
+        for the former, self.rate_limit_retries for the latter. A 429 is the
+        site asking us to slow down, not a broken circuit, so it gets more
+        and longer waits (Retry-After if sent, else exponential backoff
+        capped at self.max_backoff) instead of giving up after ~45s and
+        abandoning the whole shop.
+
+        Every 429 also raises self.request_delay (the pause callers sleep
+        between pages), and every other response lowers it back toward
+        self.min_delay, so the scrape settles near the fastest rate the
+        site tolerates instead of repeatedly tripping the limit.
 
         Returns the raw response without checking its status otherwise —
         callers decide what counts as success via response.raise_for_status().
@@ -151,39 +165,63 @@ class Scraper:
         if not self.client:
             raise RuntimeError("Scraper must be used within a 'with' context manager.")
 
-        for attempt in range(1, self.retries + 1):
-            logger.info(f"{method} {url} (attempt {attempt}/{self.retries})")
+        network_failures = 0
+        rate_limited = 0
+        attempt = 0
+        while True:
+            attempt += 1
+            logger.info(f"{method} {url} (attempt {attempt})")
             try:
                 response = self.client.request(method, url, **kwargs)
             except httpx.RequestError as exc:
-                if attempt == self.retries:
+                network_failures += 1
+                if network_failures >= self.retries:
                     logger.error(
-                        f"{type(exc).__name__} on final attempt {attempt}/{self.retries} "
-                        f"for {method} {url}: {exc}"
+                        f"{type(exc).__name__} on final attempt "
+                        f"{network_failures}/{self.retries} for {method} {url}: {exc}"
                     )
                     raise
-                wait = self.backoff_base * (2 ** (attempt - 1))
+                wait = self.backoff_base * (2 ** (network_failures - 1))
                 logger.warning(
-                    f"{type(exc).__name__} on attempt {attempt}/{self.retries} for "
-                    f"{method} {url}: {exc}, waiting {wait}s"
+                    f"{type(exc).__name__} on attempt {network_failures}/{self.retries} "
+                    f"for {method} {url}: {exc}, waiting {wait}s"
                 )
                 time.sleep(wait)
                 continue
 
             logger.info(f"{method} {url} -> {response.status_code}")
 
-            if response.status_code == 429 and attempt < self.retries:
-                wait = self.backoff_base * (2 ** (attempt - 1))
-                logger.warning(
-                    f"Rate limited (429) on attempt {attempt}/{self.retries}, "
-                    f"waiting {wait}s"
+            if response.status_code != 429:
+                self._speed_up()
+                return response
+
+            rate_limited += 1
+            self._slow_down()
+            if rate_limited > self.rate_limit_retries:
+                logger.error(
+                    f"Still rate limited (429) after {self.rate_limit_retries} "
+                    f"retries for {method} {url}, giving up"
                 )
-                time.sleep(wait)
-                continue
+                return response
 
-            return response
+            wait = self._rate_limit_wait(response, rate_limited)
+            logger.warning(
+                f"Rate limited (429) {rate_limited}/{self.rate_limit_retries}, "
+                f"waiting {wait:.0f}s, request_delay now {self.request_delay:.1f}s"
+            )
+            time.sleep(wait)
 
-        return response
+    def _rate_limit_wait(self, response: httpx.Response, rate_limited: int) -> float:
+        retry_after = response.headers.get("Retry-After", "")
+        if retry_after.isdigit():
+            return min(float(retry_after), self.max_backoff)
+        return min(self.backoff_base * (2 ** (rate_limited - 1)), self.max_backoff)
+
+    def _slow_down(self) -> None:
+        self.request_delay = min(max(self.request_delay * 2, 1.0), self.max_delay)
+
+    def _speed_up(self) -> None:
+        self.request_delay = max(self.request_delay * 0.95, self.min_delay)
 
     def load_url(self, url: str) -> str | None:
         try:
