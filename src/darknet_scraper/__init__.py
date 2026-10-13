@@ -13,7 +13,7 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 
 from darknet_scraper.config import ScraperConfig
-from darknet_scraper.scraper import RateLimited, Scraper, SessionExpired
+from darknet_scraper.scraper import Scraper, SessionExpired
 
 logger = logging.getLogger(__name__)
 
@@ -70,23 +70,11 @@ def load_with_reauth(s: Scraper, url: str) -> str | None:
     that is still rejected right after a fresh login is treated as
     page-specific (e.g. a removed shop redirecting away) and returns None,
     instead of raising and taking the whole run down.
-
-    A session that looks blocked (RateLimited) gets a long pause and a fresh
-    login before the one retry. If it is still blocked after that, or the
-    login itself is rate limited, RateLimited propagates and ends the run:
-    Docker restarts it, and every finished page is already cached.
     """
     try:
         return s.load_url(url)
     except SessionExpired as exc:
         logger.warning(f"Session expired ({exc}), re-authenticating")
-        s.reauth()
-    except RateLimited as exc:
-        logger.warning(
-            f"Session looks rate limited ({exc}), pausing "
-            f"{s.rate_limit_cooldown:.0f}s, then re-authenticating"
-        )
-        time.sleep(s.rate_limit_cooldown)
         s.reauth()
 
     parts = urlsplit(url)
