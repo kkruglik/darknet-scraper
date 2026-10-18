@@ -249,6 +249,15 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(self.scraper.client.request.call_count, 3)
 
+    def test_one_shot_request_is_not_replayed_on_429(self):
+        self.respond(429, 200)
+
+        with self.assertLogs("darknet_scraper", level="ERROR"):
+            response = self.scraper.request("POST", "https://example.test/login", rate_limit_retries=0)
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(self.scraper.client.request.call_count, 1)
+
     def test_delay_never_drops_below_configured_minimum(self):
         self.respond(200, 200)
 

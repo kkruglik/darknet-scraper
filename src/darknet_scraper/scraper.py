@@ -146,11 +146,15 @@ class Scraper:
         parts = urlsplit(url)
         return urlunsplit(("", "", parts.path, parts.query, parts.fragment))
 
-    def request(self, method: str, url: str, **kwargs) -> httpx.Response:
+    def request(
+        self, method: str, url: str, *, rate_limit_retries: int | None = None, **kwargs
+    ) -> httpx.Response:
         """Make a request, retrying on network errors and 429s with backoff.
 
         Network errors and 429s have separate retry budgets: self.retries
-        for the former, self.rate_limit_retries for the latter. A 429 is the
+        for the former, rate_limit_retries (default self.rate_limit_retries)
+        for the latter. Captcha and login POSTs pass 0: their answer is
+        single-use, so replaying it after a 429 is always rejected. A 429 is the
         site asking us to slow down, not a broken circuit, so it gets more
         and longer waits (Retry-After if sent, else exponential backoff
         capped at self.max_backoff) instead of giving up after ~45s and
@@ -171,6 +175,8 @@ class Scraper:
         if not self.client:
             raise RuntimeError("Scraper must be used within a 'with' context manager.")
 
+        if rate_limit_retries is None:
+            rate_limit_retries = self.rate_limit_retries
         network_failures = 0
         rate_limited = 0
         attempt = 0
@@ -204,10 +210,10 @@ class Scraper:
 
             rate_limited += 1
             self._slow_down()
-            if rate_limited > self.rate_limit_retries:
+            if rate_limited > rate_limit_retries:
                 self._schedule_next(self.request_delay)
                 logger.error(
-                    f"Still rate limited (429) after {self.rate_limit_retries} "
+                    f"Still rate limited (429) after {rate_limit_retries} "
                     f"retries for {method} {url}, giving up"
                 )
                 return response
@@ -216,7 +222,7 @@ class Scraper:
                 max(self._rate_limit_wait(response, rate_limited), self.request_delay)
             )
             logger.warning(
-                f"Rate limited (429) {rate_limited}/{self.rate_limit_retries}, "
+                f"Rate limited (429) {rate_limited}/{rate_limit_retries}, "
                 f"waiting {wait:.1f}s, request_delay now {self.request_delay:.1f}s"
             )
 
@@ -529,7 +535,14 @@ class Scraper:
                     "answer": answer.upper(),
                 },
                 follow_redirects=True,
+                rate_limit_retries=0,
             )
+            if resp.status_code == 429:
+                logger.warning(f"auth(): image captcha attempt {attempt} got 429, loading a fresh captcha")
+                if attempt == max_captcha_retries:
+                    raise AuthError("Image captcha retries exhausted (rate limited)")
+                html = self.solve_tck_bootstrap(captcha_url)
+                continue
             resp.raise_for_status()
             html = resp.text
 
@@ -540,8 +553,9 @@ class Scraper:
             if attempt == max_captcha_retries:
                 raise AuthError("Image captcha retries exhausted")
 
+        login_page_url = str(resp.url)
         login_form = self.parse_login_form(html)
-        action_url = urljoin(str(resp.url), login_form["action"])
+        action_url = urljoin(login_page_url, login_form["action"])
         logger.info(f"auth(): login form parsed, will post credentials to {action_url}")
 
         for attempt in range(1, max_captcha_retries + 1):
@@ -566,7 +580,18 @@ class Scraper:
                     "captcha": cyrillic_answer.upper(),
                 },
                 follow_redirects=True,
+                rate_limit_retries=0,
             )
+            if resp.status_code == 429:
+                logger.warning(f"auth(): login attempt {attempt} got 429, reloading the login page")
+                if attempt == max_captcha_retries:
+                    raise AuthError("Login captcha retries exhausted (rate limited)")
+                resp = self.request("GET", login_page_url, follow_redirects=True)
+                resp.raise_for_status()
+                login_page_url = str(resp.url)
+                login_form = self.parse_login_form(resp.text)
+                action_url = urljoin(login_page_url, login_form["action"])
+                continue
             resp.raise_for_status()
             html = resp.text
 
@@ -582,8 +607,9 @@ class Scraper:
                 raise AuthError(
                     "Login captcha retries exhausted or credentials rejected"
                 )
+            login_page_url = str(resp.url)
             login_form = self.parse_login_form(html)
-            action_url = urljoin(str(resp.url), login_form["action"])
+            action_url = urljoin(login_page_url, login_form["action"])
 
         parts = urlsplit(str(resp.url))
         self.base_url = urlunsplit((parts.scheme, parts.netloc, "", "", ""))
