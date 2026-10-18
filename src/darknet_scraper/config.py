@@ -3,12 +3,17 @@ from pathlib import Path
 from pydantic import BaseModel, Field, SecretStr
 
 
-class AuthConfig(BaseModel):
+class AccountConfig(BaseModel):
     login: str
     password: SecretStr
+
+
+class AuthConfig(BaseModel):
     captcha_key: SecretStr
     captcha_url: str
     max_captcha_retries: int = Field(default=5, ge=1)
+    # One scraping worker per account.
+    accounts: list[AccountConfig] = Field(min_length=1)
 
 
 class ShopsConfig(BaseModel):

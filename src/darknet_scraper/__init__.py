@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -210,7 +211,12 @@ def scrape_all_shops(
 
 
 def scrape_all_reviews(
-    s: Scraper, input_file: Path, cache_dir: Path, output_dir: Path
+    s: Scraper,
+    input_file: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    worker: int = 0,
+    workers: int = 1,
 ) -> None:
     started_at = time.monotonic()
     logger.info(
@@ -220,9 +226,8 @@ def scrape_all_reviews(
         logger.error(f"Cannot scrape reviews: shop file not found: {input_file}")
         raise RuntimeError("Shop file not found")
 
-    shop_ids = pd.read_csv(input_file)["shop_id"].to_list()
+    shop_ids = pd.read_csv(input_file)["shop_id"].to_list()[worker::workers]
     cache_dir.mkdir(parents=True, exist_ok=True)
-    migrate_cache_keys(s, cache_dir)
     cached_pages = {p.name for p in cache_dir.rglob("*.json")}
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -239,7 +244,7 @@ def scrape_all_reviews(
     incomplete_shops = 0
     total_shops = len(shop_ids)
     logger.info(f"Loaded {total_shops} shops for review scraping")
-    shop_pbar = tqdm(shop_ids, desc="Shops", unit="shop")
+    shop_pbar = tqdm(shop_ids, desc=f"W{worker + 1} shops", unit="shop", position=worker)
     for shop_num, shop_id in enumerate(shop_pbar, start=1):
         shop_pbar.set_postfix(reviews=total_reviews)
         shop_csv = output_dir / f"{shop_id}.csv"
@@ -273,7 +278,11 @@ def scrape_all_reviews(
         shop_reviews = []
         complete = True
         page_pbar = tqdm(
-            range(1, last_page + 1), desc="  Review pages", unit="page", leave=False
+            range(1, last_page + 1),
+            desc="  Review pages",
+            unit="page",
+            leave=False,
+            disable=workers > 1,
         )
         for page_num in page_pbar:
             page_url = f"{comments_url}?p={page_num}"
@@ -364,14 +373,18 @@ def scrape_all_reviews(
 
 
 def scrape_all_products(
-    s: Scraper, input_file: Path, cache_dir: Path, output_dir: Path
+    s: Scraper,
+    input_file: Path,
+    cache_dir: Path,
+    output_dir: Path,
+    worker: int = 0,
+    workers: int = 1,
 ) -> None:
     if not input_file.exists():
         raise RuntimeError("Shops file not found")
 
-    shop_ids = pd.read_csv(input_file)["shop_id"].to_list()
+    shop_ids = pd.read_csv(input_file)["shop_id"].to_list()[worker::workers]
     cache_dir.mkdir(parents=True, exist_ok=True)
-    migrate_cache_keys(s, cache_dir)
     cached_pages = {p.name for p in cache_dir.rglob("*.json")}
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -382,7 +395,7 @@ def scrape_all_products(
     total_products = 0
     scraped_shops = 0
     total_shops = len(shop_ids)
-    shop_pbar = tqdm(shop_ids, desc="Shops", unit="shop")
+    shop_pbar = tqdm(shop_ids, desc=f"W{worker + 1} shops", unit="shop", position=worker)
     for shop_num, shop_id in enumerate(shop_pbar, start=1):
         shop_pbar.set_postfix(products=total_products)
         shop_csv = output_dir / f"{shop_id}.csv"
@@ -408,7 +421,11 @@ def scrape_all_products(
         shop_products = []
         complete = True
         page_pbar = tqdm(
-            range(1, last_page + 1), desc="  Product pages", unit="page", leave=False
+            range(1, last_page + 1),
+            desc="  Product pages",
+            unit="page",
+            leave=False,
+            disable=workers > 1,
         )
         for page_num in page_pbar:
             page_url = f"{shop_url}?p={page_num}"
@@ -492,7 +509,9 @@ def main() -> None:
     log_dir = resolve(Path("logs"))
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(threadName)s %(name)s: %(message)s"
+    )
 
     # 10MB x 5 backups: bounded disk usage for a long-running/unattended scrape
     # instead of one log file growing forever.
@@ -517,29 +536,78 @@ def main() -> None:
 
     from darknet_scraper.tor_client import DEFAULT_CONTROL_PORT, DEFAULT_SOCKS_PROXY, TorScraper
 
-    scraper = TorScraper(
-        url,
-        headers,
-        cookies,
-        request_delay=3.0,
-        socks_proxy=os.environ.get("TOR_SOCKS_PROXY", DEFAULT_SOCKS_PROXY),
-        control_port=int(os.environ.get("TOR_CONTROL_PORT", DEFAULT_CONTROL_PORT)),
-    )
-    with scraper as s:
-        logger.info("Phase 0: authenticating")
+    accounts = config.auth.accounts
+    workers = len(accounts)
+
+    def make_scraper(worker: int) -> TorScraper:
+        # A distinct SOCKS username per worker makes Tor (IsolateSOCKSAuth,
+        # on by default) put each worker on its own circuit, so the site sees
+        # separate clients instead of one client with several sessions.
+        proxy = urlsplit(os.environ.get("TOR_SOCKS_PROXY", DEFAULT_SOCKS_PROXY))
+        proxy = urlunsplit(
+            proxy._replace(netloc=f"worker{worker}:x@{proxy.hostname}:{proxy.port}")
+        )
+        return TorScraper(
+            url,
+            headers,
+            cookies,
+            request_delay=3.0,
+            socks_proxy=proxy,
+            control_port=int(os.environ.get("TOR_CONTROL_PORT", DEFAULT_CONTROL_PORT)),
+        )
+
+    def login(s: TorScraper, worker: int) -> None:
+        account = accounts[worker]
+        logger.info(f"Worker {worker}: authenticating as {account.login}")
         s.auth(
             config.auth.captcha_url,
-            config.auth.login,
-            config.auth.password.get_secret_value(),
+            account.login,
+            account.password.get_secret_value(),
             config.auth.captcha_key.get_secret_value(),
             config.auth.max_captcha_retries,
         )
-        logger.info(f"Authenticated, main site resolved to {s.base_url}")
+        logger.info(f"Worker {worker}: authenticated, main site resolved to {s.base_url}")
 
-        shops_file = resolve(config.scrape_shops.output_file)
-        if shops_file.exists():
-            logger.info(f"Phase 1: skipped, {shops_file} already exists")
-        else:
+    def run_worker(worker: int) -> None:
+        with make_scraper(worker) as s:
+            login(s, worker)
+
+            logger.info(f"Phase 2: worker {worker} scraping products for its shops")
+            scrape_all_products(
+                s,
+                resolve(config.scrape_products.input_file),
+                resolve(config.scrape_products.cache_dir),
+                resolve(config.scrape_products.output_dir),
+                worker,
+                workers,
+            )
+
+            logger.info(f"Phase 3: worker {worker} scraping reviews for its shops")
+            scrape_all_reviews(
+                s,
+                resolve(config.scrape_reviews.input_file),
+                resolve(config.scrape_reviews.cache_dir),
+                resolve(config.scrape_reviews.output_dir),
+                worker,
+                workers,
+            )
+
+    # Once, before the workers start: concurrent renames in one cache dir
+    # would race each other.
+    for cache_dir in (config.scrape_products.cache_dir, config.scrape_reviews.cache_dir):
+        cache_dir = resolve(cache_dir)
+        if cache_dir.exists():
+            migrate_cache_keys(Scraper, cache_dir)
+
+    shops_file = resolve(config.scrape_shops.output_file)
+    if shops_file.exists():
+        logger.info(f"Phase 1: skipped, {shops_file} already exists")
+    else:
+        # Single-threaded: the page count is only known after the first page,
+        # and it's a one-time phase.
+        with make_scraper(0) as s:
+            login(s, 0)
+
             # Use the path from config, but the domain auth() actually
             # resolved to — the configured domain goes stale as soon as the
             # main-site mirror rotates, which happens between runs (and
@@ -563,18 +631,16 @@ def main() -> None:
                 shops_file,
             )
 
-        logger.info("Phase 2: scraping products for each shop")
-        scrape_all_products(
-            s,
-            resolve(config.scrape_products.input_file),
-            resolve(config.scrape_products.cache_dir),
-            resolve(config.scrape_products.output_dir),
-        )
+    # Each worker gets every workers-th shop, so they never share a shop,
+    # cache file or CSV and need no locks.
+    logger.info(f"Starting {workers} worker(s), one per account")
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="worker") as pool:
+        futures = [pool.submit(run_worker, worker) for worker in range(workers)]
 
-        logger.info("Phase 3: scraping reviews for each shop")
-        scrape_all_reviews(
-            s,
-            resolve(config.scrape_reviews.input_file),
-            resolve(config.scrape_reviews.cache_dir),
-            resolve(config.scrape_reviews.output_dir),
-        )
+    failed = 0
+    for worker, future in enumerate(futures):
+        if exc := future.exception():
+            failed += 1
+            logger.error(f"Worker {worker} failed", exc_info=exc)
+    if failed:
+        raise RuntimeError(f"{failed}/{workers} worker(s) failed")

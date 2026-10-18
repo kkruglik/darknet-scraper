@@ -139,6 +139,24 @@ class WorkflowLoggingTests(unittest.TestCase):
         )
         self.assertEqual(len(pd.read_csv(self.output_dir / "101.csv")), 2)
 
+    def test_worker_scrapes_only_its_share_of_shops(self):
+        pd.DataFrame({"shop_id": [101, 102, 103, 104]}).to_csv(self.input_file, index=False)
+        self.scraper.get_last_page_number.return_value = 1
+        self.scraper.scrape_shop_reviews.return_value = []
+
+        scrape_all_reviews(
+            self.scraper, self.input_file, self.cache_dir, self.output_dir, worker=1, workers=2
+        )
+
+        self.assertEqual(
+            [c.args[0] for c in self.scraper.load_url.call_args_list],
+            [
+                "https://example.test/shop_comments/102",
+                "https://example.test/shop_comments/104",
+            ],
+        )
+        self.assertEqual(sorted(p.name for p in self.output_dir.glob("*.csv")), ["102.csv", "104.csv"])
+
     def test_missing_review_pagination_and_empty_page_are_warnings(self):
         self.scraper.get_last_page_number.return_value = None
         self.scraper.scrape_shop_reviews.return_value = []
