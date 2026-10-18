@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -88,6 +89,7 @@ class Scraper:
         rate_limit_retries: int = 10,
         max_backoff: float = 60.0,
         max_delay: float = 30.0,
+        jitter: float = 0.5,
     ):
         self.base_url = base_url
         self.client = None
@@ -96,7 +98,9 @@ class Scraper:
         self.timeout = timeout
         self.request_delay = request_delay
         self.min_delay = request_delay
+        self._next_request_at = 0.0
         self.max_delay = max_delay
+        self.jitter = jitter
         self.retries = retries
         self.backoff_base = backoff_base
         self.rate_limit_retries = rate_limit_retries
@@ -152,8 +156,10 @@ class Scraper:
         capped at self.max_backoff) instead of giving up after ~45s and
         abandoning the whole shop.
 
-        Every 429 also raises self.request_delay (the pause callers sleep
-        between pages), and every other response lowers it back toward
+        Every request, auth and retries included, starts at least
+        self.request_delay after the previous response, so callers never
+        need to sleep between pages themselves. Every 429 raises
+        self.request_delay and every other response lowers it back toward
         self.min_delay, so the scrape settles near the fastest rate the
         site tolerates instead of repeatedly tripping the limit.
 
@@ -170,6 +176,7 @@ class Scraper:
         attempt = 0
         while True:
             attempt += 1
+            self._wait_turn()
             logger.info(f"{method} {url} (attempt {attempt})")
             try:
                 response = self.client.request(method, url, **kwargs)
@@ -181,35 +188,49 @@ class Scraper:
                         f"{network_failures}/{self.retries} for {method} {url}: {exc}"
                     )
                     raise
-                wait = self.backoff_base * (2 ** (network_failures - 1))
+                wait = self._schedule_next(self.backoff_base * (2 ** (network_failures - 1)))
                 logger.warning(
                     f"{type(exc).__name__} on attempt {network_failures}/{self.retries} "
-                    f"for {method} {url}: {exc}, waiting {wait}s"
+                    f"for {method} {url}: {exc}, waiting {wait:.1f}s"
                 )
-                time.sleep(wait)
                 continue
 
             logger.info(f"{method} {url} -> {response.status_code}")
 
             if response.status_code != 429:
                 self._speed_up()
+                self._schedule_next(self.request_delay)
                 return response
 
             rate_limited += 1
             self._slow_down()
             if rate_limited > self.rate_limit_retries:
+                self._schedule_next(self.request_delay)
                 logger.error(
                     f"Still rate limited (429) after {self.rate_limit_retries} "
                     f"retries for {method} {url}, giving up"
                 )
                 return response
 
-            wait = self._rate_limit_wait(response, rate_limited)
+            wait = self._schedule_next(
+                max(self._rate_limit_wait(response, rate_limited), self.request_delay)
+            )
             logger.warning(
                 f"Rate limited (429) {rate_limited}/{self.rate_limit_retries}, "
-                f"waiting {wait:.0f}s, request_delay now {self.request_delay:.1f}s"
+                f"waiting {wait:.1f}s, request_delay now {self.request_delay:.1f}s"
             )
-            time.sleep(wait)
+
+    def _wait_turn(self) -> None:
+        pause = self._next_request_at - time.monotonic()
+        if pause > 0:
+            time.sleep(pause)
+
+    def _schedule_next(self, delay: float) -> float:
+        # Stretch each wait by a random 0..jitter fraction: a perfectly even
+        # request rhythm is an easy bot signal, and delay stays the minimum.
+        delay *= random.uniform(1.0, 1.0 + self.jitter)
+        self._next_request_at = time.monotonic() + delay
+        return delay
 
     def _rate_limit_wait(self, response: httpx.Response, rate_limited: int) -> float:
         retry_after = response.headers.get("Retry-After", "")

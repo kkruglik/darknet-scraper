@@ -103,7 +103,7 @@ class WorkflowLoggingTests(unittest.TestCase):
         self.assertEqual(output_file.read_text(), "author,shop_id\ncached,101\n")
 
     def test_incomplete_reviews_are_not_reported_as_written(self):
-        self.scraper.load_url.side_effect = ["<html></html>", "<html></html>", None]
+        self.scraper.load_url.side_effect = ["<html></html>", None]
         self.scraper.scrape_shop_reviews.return_value = [{"author": "fresh"}]
 
         with self.assertLogs("darknet_scraper", level="INFO") as logs:
@@ -126,6 +126,18 @@ class WorkflowLoggingTests(unittest.TestCase):
         self.assertIn("first review page unavailable, CSV not written", messages)
         self.assertIn("skipped=0, incomplete=1", messages)
         self.assertFalse((self.output_dir / "101.csv").exists())
+
+    def test_first_review_page_is_not_requested_twice(self):
+        self.scraper.scrape_shop_reviews.return_value = [{"author": "fresh"}]
+
+        self.scrape_reviews()
+
+        url = self.scraper.build_url("shop_comments", 101)
+        self.assertEqual(
+            [c.args[0] for c in self.scraper.load_url.call_args_list],
+            [url, f"{url}?p=2"],
+        )
+        self.assertEqual(len(pd.read_csv(self.output_dir / "101.csv")), 2)
 
     def test_missing_review_pagination_and_empty_page_are_warnings(self):
         self.scraper.get_last_page_number.return_value = None
@@ -189,9 +201,21 @@ class CacheKeyTests(unittest.TestCase):
 
 class RateLimitTests(unittest.TestCase):
     def setUp(self):
-        self.scraper = Scraper("https://example.test", {}, {}, request_delay=1.0, backoff_base=3.0)
+        self.scraper = Scraper(
+            "https://example.test", {}, {}, request_delay=1.0, backoff_base=3.0, jitter=0.0
+        )
         self.scraper.client = Mock()
-        self.sleep = self.enterContext(patch("darknet_scraper.scraper.time.sleep"))
+        # Fake clock: sleeping advances monotonic time, so pacing waits are exact.
+        self.now = 1000.0
+        self.enterContext(
+            patch("darknet_scraper.scraper.time.monotonic", side_effect=lambda: self.now)
+        )
+        self.sleep = self.enterContext(
+            patch("darknet_scraper.scraper.time.sleep", side_effect=self.advance)
+        )
+
+    def advance(self, seconds):
+        self.now += seconds
 
     def respond(self, *statuses, headers=None):
         self.scraper.client.request.side_effect = [
@@ -232,6 +256,37 @@ class RateLimitTests(unittest.TestCase):
         self.scraper.request("GET", "https://example.test/b")
 
         self.assertEqual(self.scraper.request_delay, 1.0)
+
+    def test_consecutive_requests_are_paced_by_request_delay(self):
+        self.respond(200, 200, 200)
+
+        self.scraper.request("GET", "https://example.test/a")
+        self.scraper.request("GET", "https://example.test/b")
+        self.advance(5.0)
+        self.scraper.request("GET", "https://example.test/c")
+
+        # b waits out the delay after a; c comes after a 5s gap, so no wait.
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [1.0])
+
+    def test_jitter_only_stretches_the_delay(self):
+        self.scraper.jitter = 0.5
+        self.respond(200, 200)
+
+        with patch("darknet_scraper.scraper.random.uniform", return_value=1.3) as uniform:
+            self.scraper.request("GET", "https://example.test/a")
+            self.scraper.request("GET", "https://example.test/b")
+
+        uniform.assert_called_with(1.0, 1.5)
+        self.assertEqual(self.sleep.call_count, 1)
+        self.assertAlmostEqual(self.sleep.call_args.args[0], 1.3)
+
+    def test_429_wait_is_never_shorter_than_request_delay(self):
+        self.scraper.request_delay = 16.0
+        self.respond(429, 200)
+
+        self.scraper.request("GET", "https://example.test/page")
+
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [30.0])
 
 
 if __name__ == "__main__":

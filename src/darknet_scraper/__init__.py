@@ -154,7 +154,6 @@ def scrape_all_shops(
         return
 
     logger.info(f"Found {last_page} pages to scrape")
-    time.sleep(s.request_delay)
 
     pbar = tqdm(range(1, last_page + 1), desc="Shop pages", unit="page")
     for page_num in pbar:
@@ -196,8 +195,6 @@ def scrape_all_shops(
             f"Shop page {page_num}/{last_page}: found {len(found)} shop IDs, "
             f"total={len(shop_ids)}, cached to {cache_dir / cache_filename}"
         )
-
-        time.sleep(s.request_delay)
 
     pbar.close()
     logger.info(
@@ -254,7 +251,7 @@ def scrape_all_reviews(
             continue
 
         log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: starting review collection")
-        page_html = load_with_reauth(s, s.build_url("shop_comments", shop_id))
+        first_page_html = page_html = load_with_reauth(s, s.build_url("shop_comments", shop_id))
         comments_url = s.build_url("shop_comments", shop_id)
         if not page_html:
             log_progress(
@@ -294,8 +291,13 @@ def scrape_all_reviews(
                 page_pbar.set_postfix(reviews=len(shop_reviews))
                 continue
 
-            logger.info(f"Shop {shop_id}: loading review page {page_num}/{last_page}")
-            page_html = load_with_reauth(s, page_url)
+            # Page 1 is the page already loaded to read the pagination, so
+            # reuse it instead of requesting the same content twice.
+            if page_num == 1:
+                page_html = first_page_html
+            else:
+                logger.info(f"Shop {shop_id}: loading review page {page_num}/{last_page}")
+                page_html = load_with_reauth(s, page_url)
             comments_url = s.build_url("shop_comments", shop_id)
             page_url = f"{comments_url}?p={page_num}"
             if not page_html:
@@ -333,8 +335,6 @@ def scrape_all_reviews(
                 f"found {len(reviews)} reviews, total={len(shop_reviews)}, "
                 f"cached to {cache_dir / cache_filename}"
             )
-
-            time.sleep(s.request_delay)
 
         page_pbar.close()
         total_reviews += len(shop_reviews)
@@ -389,7 +389,7 @@ def scrape_all_products(
         if shop_csv.exists():
             continue
 
-        page_html = load_with_reauth(s, s.build_url("shop_catalog", shop_id))
+        first_page_html = page_html = load_with_reauth(s, s.build_url("shop_catalog", shop_id))
         shop_url = s.build_url("shop_catalog", shop_id)
         if not page_html:
             log_progress(
@@ -421,7 +421,11 @@ def scrape_all_products(
                 page_pbar.set_postfix(products=len(shop_products))
                 continue
 
-            page_html = load_with_reauth(s, page_url)
+            # Page 1 is the page already loaded for shop info and pagination.
+            if page_num == 1:
+                page_html = first_page_html
+            else:
+                page_html = load_with_reauth(s, page_url)
             shop_url = s.build_url("shop_catalog", shop_id)
             page_url = f"{shop_url}?p={page_num}"
             if not page_html:
@@ -451,8 +455,6 @@ def scrape_all_products(
 
             shop_products.extend(products)
             page_pbar.set_postfix(products=len(shop_products))
-
-            time.sleep(s.request_delay)
 
         page_pbar.close()
         total_products += len(shop_products)
@@ -519,7 +521,7 @@ def main() -> None:
         url,
         headers,
         cookies,
-        request_delay=1.0,
+        request_delay=3.0,
         socks_proxy=os.environ.get("TOR_SOCKS_PROXY", DEFAULT_SOCKS_PROXY),
         control_port=int(os.environ.get("TOR_CONTROL_PORT", DEFAULT_CONTROL_PORT)),
     )
