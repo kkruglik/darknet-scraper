@@ -307,6 +307,18 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(self.scraper.client.request.call_count, 1)
 
+    def test_only_2xx_responses_lower_the_delay(self):
+        self.scraper.request_delay = 10.0
+        self.respond(302, 404, 500, 503, 200)
+
+        for i in range(4):
+            response = self.scraper.request("GET", f"https://example.test/{i}")
+            self.assertNotEqual(response.status_code, 200)
+            self.assertEqual(self.scraper.request_delay, 10.0)
+        self.scraper.request("GET", "https://example.test/ok")
+
+        self.assertAlmostEqual(self.scraper.request_delay, 10.0 - 0.2)
+
     def test_delay_never_drops_below_configured_minimum(self):
         self.respond(200, 200)
 

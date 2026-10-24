@@ -212,7 +212,10 @@ class Scraper:
             logger.info(f"{method} {url} -> {response.status_code}")
 
             if response.status_code != 429:
-                self._speed_up()
+                # Only a real success is evidence the pace is fine: a 5xx, or
+                # the 302 an expired session gets, says nothing about the limit.
+                if 200 <= response.status_code < 300:
+                    self._speed_up()
                 self._schedule_next(self.request_delay)
                 return response
 
