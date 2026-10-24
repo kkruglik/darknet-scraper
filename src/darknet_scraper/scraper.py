@@ -105,6 +105,7 @@ class Scraper:
         self.backoff_base = backoff_base
         self.rate_limit_retries = rate_limit_retries
         self.max_backoff = max_backoff
+        self._logged_429_body = False
 
     def build_url(
         self,
@@ -223,8 +224,29 @@ class Scraper:
             )
             logger.warning(
                 f"Rate limited (429) {rate_limited}/{rate_limit_retries}, "
-                f"waiting {wait:.1f}s, request_delay now {self.request_delay:.1f}s"
+                f"waiting {wait:.1f}s, request_delay now {self.request_delay:.1f}s, "
+                f"{self._describe_429(url, response)}"
             )
+
+    def _describe_429(self, url: str, response: httpx.Response) -> str:
+        """What the site said alongside a 429, to tell what the limit is keyed on.
+
+        The body is logged once per instance: it's the same page every time,
+        and one sample is enough to see whether it names a limit or a wait.
+        """
+        if not self._logged_429_body:
+            self._logged_429_body = True
+            logger.info(f"First 429 body for {url}: {str(response.text)[:200]!r}")
+        limit_headers = {
+            k: v
+            for k, v in response.headers.items()
+            if k.lower().startswith(("x-ratelimit-", "ratelimit-"))
+        }
+        return (
+            f"host={urlsplit(url).netloc}, "
+            f"retry_after={response.headers.get('Retry-After', '-')}, "
+            f"limit_headers={limit_headers or '-'}"
+        )
 
     def _wait_turn(self) -> None:
         pause = self._next_request_at - time.monotonic()

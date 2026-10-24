@@ -257,6 +257,24 @@ class RateLimitTests(unittest.TestCase):
 
         self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [120.0, 120.0])
 
+    def test_429_log_names_host_retry_after_and_limit_headers(self):
+        self.respond(
+            429,
+            429,
+            200,
+            headers={"Retry-After": "7", "X-RateLimit-Remaining": "0", "Server": "nginx"},
+        )
+
+        with self.assertLogs("darknet_scraper", level="INFO") as logs:
+            self.scraper.request("GET", "https://mirror-a.onion/shop/comments/101/?p=2")
+
+        warnings = [m for m in logs.output if m.startswith("WARNING")]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("host=mirror-a.onion, retry_after=7", warnings[0])
+        self.assertIn("{'X-RateLimit-Remaining': '0'}", warnings[0])
+        self.assertNotIn("nginx", warnings[0])
+        self.assertEqual(sum("First 429 body" in m for m in logs.output), 1)
+
     def test_gives_up_after_rate_limit_retries(self):
         self.scraper.rate_limit_retries = 2
         self.respond(429, 429, 429)
