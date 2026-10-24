@@ -9,7 +9,12 @@ from unittest.mock import Mock, patch
 import httpx2 as httpx
 import pandas as pd
 
-from darknet_scraper import migrate_cache_keys, scrape_all_reviews, scrape_all_shops
+from darknet_scraper import (
+    migrate_cache_keys,
+    run_supervised,
+    scrape_all_reviews,
+    scrape_all_shops,
+)
 from darknet_scraper.auth import AuthError
 from darknet_scraper.scraper import ImageCaptchaForm, Scraper
 
@@ -217,6 +222,71 @@ class CacheKeyTests(unittest.TestCase):
 
         self.assertFalse(legacy.exists())
         self.assertEqual(sorted(p.name for p in self.cache_dir.glob("*.json")), names)
+
+
+class WorkerSupervisorTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.enterContext(patch("darknet_scraper.time.monotonic", side_effect=lambda: self.now))
+        self.sleep = self.enterContext(
+            patch("darknet_scraper.time.sleep", side_effect=self.advance)
+        )
+        self.generations = []
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def worker(self, outcomes):
+        """run_once that runs for `uptime` seconds, then raises or returns."""
+
+        def run_once(generation):
+            self.generations.append(generation)
+            uptime, exc = outcomes.pop(0)
+            self.now += uptime
+            if exc:
+                raise exc
+
+        return run_once
+
+    def sleeps(self):
+        return [c.args[0] for c in self.sleep.call_args_list]
+
+    def test_crashed_worker_restarts_with_a_new_generation(self):
+        run_once = self.worker([(5.0, KeyError("bad page")), (5.0, None)])
+
+        with self.assertLogs("darknet_scraper", level="ERROR") as logs:
+            run_supervised(2, run_once)
+
+        self.assertEqual(self.generations, [0, 1])
+        self.assertEqual(self.sleeps(), [60.0])
+        self.assertIn("Worker 2 crashed after 5s, restarting in 60s", logs.output[0])
+
+    def test_quick_crashes_back_off_then_give_up(self):
+        run_once = self.worker([(5.0, ValueError("same bug"))] * 5)
+
+        with self.assertLogs("darknet_scraper", level="ERROR") as logs:
+            with self.assertRaises(ValueError):
+                run_supervised(0, run_once)
+
+        self.assertEqual(self.sleeps(), [60.0, 120.0, 240.0, 480.0])
+        self.assertIn("giving up", logs.output[-1])
+
+    def test_crash_after_a_healthy_run_restarts_quickly_and_never_gives_up(self):
+        outcomes = [(5.0, ValueError("x"))] * 4 + [(3600.0, ValueError("y"))] * 4 + [(5.0, None)]
+        run_once = self.worker(outcomes)
+
+        with self.assertLogs("darknet_scraper", level="ERROR"):
+            run_supervised(1, run_once)
+
+        self.assertEqual(self.sleeps(), [60.0, 120.0, 240.0, 480.0] + [60.0] * 4)
+        self.assertEqual(self.generations, list(range(9)))
+
+    def test_interrupt_is_not_swallowed(self):
+        run_once = self.worker([(5.0, KeyboardInterrupt())])
+
+        with self.assertRaises(KeyboardInterrupt):
+            run_supervised(0, run_once)
+        self.sleep.assert_not_called()
 
 
 class RateLimitTests(unittest.TestCase):

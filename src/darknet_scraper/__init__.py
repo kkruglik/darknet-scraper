@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -54,6 +55,15 @@ url = ""
 # and four at once tripped the login form's brute-force 429s.
 LOGIN_STAGGER = 60.0
 
+# A crashed worker is restarted in place rather than leaving its shops idle.
+# Crashes soon after a (re)start count as "quick"; after enough in a row the
+# worker gives up, since restarting into the same deterministic bug forever
+# would only hide it.
+WORKER_RESTART_BASE = 60.0
+WORKER_RESTART_MAX = 600.0
+WORKER_MIN_UPTIME = 600.0
+WORKER_MAX_QUICK_CRASHES = 5
+
 
 def log_progress(message: str) -> None:
     """Write a shop-level milestone to both the console and the log file.
@@ -90,6 +100,44 @@ def load_with_reauth(s: Scraper, url: str) -> str | None:
     except SessionExpired as exc:
         logger.error(f"Still rejected right after re-auth, skipping: {exc}")
         return None
+
+
+def run_supervised(worker: int, run_once: Callable[[int], None]) -> None:
+    """Run a worker, restarting it from scratch whenever it crashes.
+
+    run_once(generation) builds a fresh scraper (new client, empty cookies,
+    new Tor circuit, new login) and scrapes the worker's shops; finished
+    CSVs are skipped and pages come from the cache, so a restart resumes
+    cheaply. A crash after a healthy run restarts after WORKER_RESTART_BASE;
+    crashes within WORKER_MIN_UPTIME of starting back off further and
+    re-raise after WORKER_MAX_QUICK_CRASHES in a row.
+    """
+    generation = 0
+    quick_crashes = 0
+    while True:
+        started = time.monotonic()
+        try:
+            run_once(generation)
+            return
+        except Exception as exc:
+            uptime = time.monotonic() - started
+            quick_crashes = quick_crashes + 1 if uptime < WORKER_MIN_UPTIME else 0
+            if quick_crashes >= WORKER_MAX_QUICK_CRASHES:
+                logger.error(
+                    f"Worker {worker} crashed {quick_crashes} times in a row within "
+                    f"{WORKER_MIN_UPTIME:.0f}s of starting, giving up"
+                )
+                raise
+            wait = min(
+                WORKER_RESTART_BASE * 2 ** max(quick_crashes - 1, 0), WORKER_RESTART_MAX
+            )
+            generation += 1
+            logger.error(
+                f"Worker {worker} crashed after {uptime:.0f}s, restarting in {wait:.0f}s "
+                f"with a new Tor circuit (generation {generation})",
+                exc_info=exc,
+            )
+            time.sleep(wait)
 
 
 def migrate_cache_keys(s: Scraper, cache_dir: Path) -> None:
@@ -544,13 +592,17 @@ def main() -> None:
     accounts = config.auth.accounts
     workers = len(accounts)
 
-    def make_scraper(worker: int) -> TorScraper:
+    def make_scraper(worker: int, generation: int = 0) -> TorScraper:
         # A distinct SOCKS username per worker makes Tor (IsolateSOCKSAuth,
         # on by default) put each worker on its own circuit, so the site sees
-        # separate clients instead of one client with several sessions.
+        # separate clients instead of one client with several sessions. A new
+        # generation after a crash gets a new username, so only that worker
+        # moves to a fresh circuit (NEWNYM would reset every worker's).
         proxy = urlsplit(os.environ.get("TOR_SOCKS_PROXY", DEFAULT_SOCKS_PROXY))
         proxy = urlunsplit(
-            proxy._replace(netloc=f"worker{worker}:x@{proxy.hostname}:{proxy.port}")
+            proxy._replace(
+                netloc=f"worker{worker}-{generation}:x@{proxy.hostname}:{proxy.port}"
+            )
         )
         return TorScraper(
             url,
@@ -577,7 +629,10 @@ def main() -> None:
         if worker:
             logger.info(f"Worker {worker}: waiting {worker * LOGIN_STAGGER:.0f}s before login")
             time.sleep(worker * LOGIN_STAGGER)
-        with make_scraper(worker) as s:
+        run_supervised(worker, lambda generation: run_worker_once(worker, generation))
+
+    def run_worker_once(worker: int, generation: int) -> None:
+        with make_scraper(worker, generation) as s:
             login(s, worker)
 
             logger.info(f"Phase 2: worker {worker} scraping products for its shops")
