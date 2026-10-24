@@ -90,6 +90,8 @@ class Scraper:
         max_backoff: float = 60.0,
         max_delay: float = 30.0,
         jitter: float = 0.5,
+        slow_down_factor: float = 1.5,
+        speed_up_step: float = 0.2,
     ):
         self.base_url = base_url
         self.client = None
@@ -101,6 +103,8 @@ class Scraper:
         self._next_request_at = 0.0
         self.max_delay = max_delay
         self.jitter = jitter
+        self.slow_down_factor = slow_down_factor
+        self.speed_up_step = speed_up_step
         self.retries = retries
         self.backoff_base = backoff_base
         self.rate_limit_retries = rate_limit_retries
@@ -163,10 +167,13 @@ class Scraper:
 
         Every request, auth and retries included, starts at least
         self.request_delay after the previous response, so callers never
-        need to sleep between pages themselves. Every 429 raises
-        self.request_delay and every other response lowers it back toward
-        self.min_delay, so the scrape settles near the fastest rate the
-        site tolerates instead of repeatedly tripping the limit.
+        need to sleep between pages themselves. Every 429 multiplies
+        self.request_delay by slow_down_factor and every other response
+        takes a fixed speed_up_step off it, down to self.min_delay. Backing
+        off hard on a 429 and recovering in small steps keeps the delay just
+        above the limit: from a 429 at delay d it takes 2.5*d successes (with
+        the defaults) to get back there, instead of the ~13 that doubling
+        and a 5% cut per success took, so far fewer requests trip it.
 
         Returns the raw response without checking its status otherwise —
         callers decide what counts as success via response.raise_for_status().
@@ -267,10 +274,12 @@ class Scraper:
         return min(self.backoff_base * (2 ** (rate_limited - 1)), self.max_backoff)
 
     def _slow_down(self) -> None:
-        self.request_delay = min(max(self.request_delay * 2, 1.0), self.max_delay)
+        self.request_delay = min(
+            max(self.request_delay * self.slow_down_factor, 1.0), self.max_delay
+        )
 
     def _speed_up(self) -> None:
-        self.request_delay = max(self.request_delay * 0.95, self.min_delay)
+        self.request_delay = max(self.request_delay - self.speed_up_step, self.min_delay)
 
     def load_url(self, url: str) -> str | None:
         try:

@@ -247,7 +247,20 @@ class RateLimitTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [3.0, 6.0])
-        self.assertAlmostEqual(self.scraper.request_delay, 4.0 * 0.95)
+        # 1.0 -> x1.5 -> x1.5 on the 429s, then one 0.2s step off on the 200.
+        self.assertAlmostEqual(self.scraper.request_delay, 2.25 - 0.2)
+
+    def test_delay_recovers_in_fixed_steps_after_a_429(self):
+        self.scraper.request_delay = 10.0
+        self.respond(429, *[200] * 25)
+
+        self.scraper.request("GET", "https://example.test/limited")
+        self.assertAlmostEqual(self.scraper.request_delay, 15.0 - 0.2)
+        for i in range(24):
+            self.scraper.request("GET", f"https://example.test/{i}")
+
+        # 2.5 * d successes to get back to the delay that tripped the limit.
+        self.assertAlmostEqual(self.scraper.request_delay, 10.0)
 
     def test_retry_after_header_is_honoured_and_capped(self):
         self.respond(429, 429, 200, headers={"Retry-After": "900"})
@@ -331,7 +344,7 @@ class RateLimitTests(unittest.TestCase):
 
         self.scraper.request("GET", "https://example.test/page")
 
-        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [30.0])
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [24.0])
 
 
 if __name__ == "__main__":
