@@ -303,6 +303,34 @@ class RateLimitTests(unittest.TestCase):
             login_page,
             self.page(200, "<html>home</html>", "https://main.onion/feed"),
         ]
+        self.stub_login_steps()
+
+        with self.assertLogs("darknet_scraper", level="WARNING"):
+            base_url = self.scraper.auth("http://captcha.onion/", "login", "pw", "key", 5)
+
+        self.assertEqual(base_url, "https://main.onion")
+        self.assertEqual(self.cooldowns(), [60.0, 120.0])
+
+    def test_third_login_429_ends_the_round_without_another_wait(self):
+        login_page = self.page(200, "<html>login</html>", "https://login.onion/")
+        # The count spans both steps: one 429 on the image captcha, two on login.
+        self.scraper.client.request.side_effect = [
+            self.page(429),
+            login_page,
+            self.page(429),
+            login_page,
+            self.page(429),
+        ]
+        self.stub_login_steps()
+
+        with self.assertLogs("darknet_scraper", level="WARNING"):
+            with self.assertRaisesRegex(AuthError, "rate limited 3 times"):
+                self.scraper.auth("http://captcha.onion/", "login", "pw", "key", 20)
+
+        self.assertEqual(self.cooldowns(), [60.0, 120.0])
+        self.assertEqual(self.scraper.client.request.call_count, 5)
+
+    def stub_login_steps(self):
         self.enterContext(
             patch.object(self.scraper, "solve_tck_bootstrap", return_value="<html></html>")
         )
@@ -324,12 +352,8 @@ class RateLimitTests(unittest.TestCase):
             patch("darknet_scraper.scraper.solve_image_captcha", return_value="answer")
         )
 
-        with self.assertLogs("darknet_scraper", level="WARNING"):
-            base_url = self.scraper.auth("http://captcha.onion/", "login", "pw", "key", 5)
-
-        self.assertEqual(base_url, "https://main.onion")
-        cooldowns = [c.args[0] for c in self.sleep.call_args_list if c.args[0] >= 60]
-        self.assertEqual(cooldowns, [120.0, 240.0])
+    def cooldowns(self):
+        return [c.args[0] for c in self.sleep.call_args_list if c.args[0] >= 60]
 
     def test_failed_login_is_retried_after_a_pause_with_fresh_cookies(self):
         self.scraper.client.cookies = Mock()
@@ -349,7 +373,7 @@ class RateLimitTests(unittest.TestCase):
             base_url = self.scraper.auth_until_success("http://captcha.onion/", "l", "p", "k", 5)
 
         self.assertEqual(base_url, "https://main.onion")
-        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [300.0, 600.0])
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [60.0, 120.0])
         self.assertEqual(self.scraper.client.cookies.clear.call_count, 2)
         self.assertEqual(len(logs.output), 2)
 
@@ -366,7 +390,7 @@ class RateLimitTests(unittest.TestCase):
 
         self.assertEqual(
             [c.args[0] for c in self.sleep.call_args_list],
-            [300.0, 600.0, 1200.0, 1800.0, 1800.0],
+            [60.0, 120.0, 240.0, 480.0, 600.0],
         )
 
     def test_unexpected_errors_in_login_still_propagate(self):
