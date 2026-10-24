@@ -49,6 +49,11 @@ cookies = {}
 
 url = ""
 
+# Seconds between worker logins at startup. Each login is a burst of
+# requests (TCK hops, two captcha POSTs) to the one shared captcha mirror,
+# and four at once tripped the login form's brute-force 429s.
+LOGIN_STAGGER = 60.0
+
 
 def log_progress(message: str) -> None:
     """Write a shop-level milestone to both the console and the log file.
@@ -559,7 +564,7 @@ def main() -> None:
     def login(s: TorScraper, worker: int) -> None:
         account = accounts[worker]
         logger.info(f"Worker {worker}: authenticating as {account.login}")
-        s.auth(
+        s.auth_until_success(
             config.auth.captcha_url,
             account.login,
             account.password.get_secret_value(),
@@ -569,6 +574,9 @@ def main() -> None:
         logger.info(f"Worker {worker}: authenticated, main site resolved to {s.base_url}")
 
     def run_worker(worker: int) -> None:
+        if worker:
+            logger.info(f"Worker {worker}: waiting {worker * LOGIN_STAGGER:.0f}s before login")
+            time.sleep(worker * LOGIN_STAGGER)
         with make_scraper(worker) as s:
             login(s, worker)
 

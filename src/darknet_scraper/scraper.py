@@ -92,6 +92,10 @@ class Scraper:
         jitter: float = 0.5,
         slow_down_factor: float = 1.5,
         speed_up_step: float = 0.2,
+        login_cooldown_base: float = 120.0,
+        login_cooldown_max: float = 900.0,
+        auth_retry_base: float = 300.0,
+        auth_retry_max: float = 1800.0,
     ):
         self.base_url = base_url
         self.client = None
@@ -105,6 +109,10 @@ class Scraper:
         self.jitter = jitter
         self.slow_down_factor = slow_down_factor
         self.speed_up_step = speed_up_step
+        self.login_cooldown_base = login_cooldown_base
+        self.login_cooldown_max = login_cooldown_max
+        self.auth_retry_base = auth_retry_base
+        self.auth_retry_max = auth_retry_max
         self.retries = retries
         self.backoff_base = backoff_base
         self.rate_limit_retries = rate_limit_retries
@@ -540,6 +548,7 @@ class Scraper:
         )
 
         logger.info(f"auth(): starting login flow at {captcha_url}")
+        login_429s = 0
         html = self.solve_tck_bootstrap(captcha_url)
         logger.info("auth(): TCK bootstrap done, parsing image captcha form")
 
@@ -572,9 +581,14 @@ class Scraper:
                 rate_limit_retries=0,
             )
             if resp.status_code == 429:
-                logger.warning(f"auth(): image captcha attempt {attempt} got 429, loading a fresh captcha")
                 if attempt == max_captcha_retries:
                     raise AuthError("Image captcha retries exhausted (rate limited)")
+                login_429s += 1
+                wait = self._login_cooldown(login_429s)
+                logger.warning(
+                    f"auth(): image captcha attempt {attempt} got 429, waiting "
+                    f"{wait:.0f}s, then loading a fresh captcha"
+                )
                 html = self.solve_tck_bootstrap(captcha_url)
                 continue
             resp.raise_for_status()
@@ -617,9 +631,14 @@ class Scraper:
                 rate_limit_retries=0,
             )
             if resp.status_code == 429:
-                logger.warning(f"auth(): login attempt {attempt} got 429, reloading the login page")
                 if attempt == max_captcha_retries:
                     raise AuthError("Login captcha retries exhausted (rate limited)")
+                login_429s += 1
+                wait = self._login_cooldown(login_429s)
+                logger.warning(
+                    f"auth(): login attempt {attempt} got 429, waiting {wait:.0f}s, "
+                    f"then reloading the login page"
+                )
                 resp = self.request("GET", login_page_url, follow_redirects=True)
                 resp.raise_for_status()
                 login_page_url = str(resp.url)
@@ -659,4 +678,40 @@ class Scraper:
         """
         if not hasattr(self, "_auth_args"):
             raise RuntimeError("reauth() called before auth() has ever succeeded")
-        return self.auth(*self._auth_args)
+        return self.auth_until_success(*self._auth_args)
+
+    def auth_until_success(self, *auth_args) -> str:
+        """auth(), retried after a growing pause instead of failing.
+
+        A failed login (captcha retries used up, the login form's brute-force
+        429s, a network error) used to propagate and end the worker, leaving
+        its share of the shops idle until every other worker had finished
+        too. Each new round starts from fresh cookies, since the failed
+        session's state is what the site was rejecting.
+        """
+        failures = 0
+        while True:
+            try:
+                return self.auth(*auth_args)
+            except (AuthError, httpx.HTTPError) as exc:
+                failures += 1
+                wait = min(self.auth_retry_base * 2 ** (failures - 1), self.auth_retry_max)
+                logger.error(
+                    f"auth(): login failed ({type(exc).__name__}: {exc}), "
+                    f"retrying in {wait:.0f}s (failure {failures})"
+                )
+                time.sleep(wait)
+                self.client.cookies.clear()
+
+    def _login_cooldown(self, login_429s: int) -> float:
+        """Delay the next login request after the login form answers 429.
+
+        This 429 is the form's brute-force protection, not the page limit:
+        it kept coming back with POSTs ~70s apart, so retrying after one
+        captcha round trip only kept tripping it. Waits grow from
+        login_cooldown_base up to login_cooldown_max.
+        """
+        wait = min(
+            self.login_cooldown_base * 2 ** (login_429s - 1), self.login_cooldown_max
+        )
+        return self._schedule_next(max(wait, self.request_delay))

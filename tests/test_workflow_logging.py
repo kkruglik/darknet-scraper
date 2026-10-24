@@ -6,10 +6,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx2 as httpx
 import pandas as pd
 
 from darknet_scraper import migrate_cache_keys, scrape_all_reviews, scrape_all_shops
-from darknet_scraper.scraper import Scraper
+from darknet_scraper.auth import AuthError
+from darknet_scraper.scraper import ImageCaptchaForm, Scraper
 
 
 class WorkflowLoggingTests(unittest.TestCase):
@@ -287,6 +289,104 @@ class RateLimitTests(unittest.TestCase):
         self.assertIn("{'X-RateLimit-Remaining': '0'}", warnings[0])
         self.assertNotIn("nginx", warnings[0])
         self.assertEqual(sum("First 429 body" in m for m in logs.output), 1)
+
+    def page(self, status, text="", url="https://example.test/"):
+        return Mock(status_code=status, headers={}, text=text, url=url)
+
+    def test_login_429_waits_a_growing_cooldown_before_the_next_try(self):
+        login_page = self.page(200, "<html>login</html>", "https://login.onion/")
+        self.scraper.client.request.side_effect = [
+            login_page,  # image captcha accepted
+            self.page(429),  # login POST: brute-force limit
+            login_page,  # reload
+            self.page(429),
+            login_page,
+            self.page(200, "<html>home</html>", "https://main.onion/feed"),
+        ]
+        self.enterContext(
+            patch.object(self.scraper, "solve_tck_bootstrap", return_value="<html></html>")
+        )
+        self.enterContext(
+            patch.object(
+                self.scraper,
+                "parse_captcha_form",
+                return_value=ImageCaptchaForm("ref", "user", "fate", "img"),
+            )
+        )
+        self.enterContext(
+            patch.object(
+                self.scraper,
+                "parse_login_form",
+                return_value={"action": "/entry/post/login", "image_b64": "img"},
+            )
+        )
+        self.enterContext(
+            patch("darknet_scraper.scraper.solve_image_captcha", return_value="answer")
+        )
+
+        with self.assertLogs("darknet_scraper", level="WARNING"):
+            base_url = self.scraper.auth("http://captcha.onion/", "login", "pw", "key", 5)
+
+        self.assertEqual(base_url, "https://main.onion")
+        cooldowns = [c.args[0] for c in self.sleep.call_args_list if c.args[0] >= 60]
+        self.assertEqual(cooldowns, [120.0, 240.0])
+
+    def test_failed_login_is_retried_after_a_pause_with_fresh_cookies(self):
+        self.scraper.client.cookies = Mock()
+        self.enterContext(
+            patch.object(
+                self.scraper,
+                "auth",
+                side_effect=[
+                    AuthError("Login captcha retries exhausted (rate limited)"),
+                    httpx.ConnectError("circuit died"),
+                    "https://main.onion",
+                ],
+            )
+        )
+
+        with self.assertLogs("darknet_scraper", level="ERROR") as logs:
+            base_url = self.scraper.auth_until_success("http://captcha.onion/", "l", "p", "k", 5)
+
+        self.assertEqual(base_url, "https://main.onion")
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [300.0, 600.0])
+        self.assertEqual(self.scraper.client.cookies.clear.call_count, 2)
+        self.assertEqual(len(logs.output), 2)
+
+    def test_auth_retry_pause_is_capped(self):
+        self.scraper.client.cookies = Mock()
+        self.enterContext(
+            patch.object(
+                self.scraper, "auth", side_effect=[AuthError("x")] * 5 + ["https://main.onion"]
+            )
+        )
+
+        with self.assertLogs("darknet_scraper", level="ERROR"):
+            self.scraper.auth_until_success()
+
+        self.assertEqual(
+            [c.args[0] for c in self.sleep.call_args_list],
+            [300.0, 600.0, 1200.0, 1800.0, 1800.0],
+        )
+
+    def test_unexpected_errors_in_login_still_propagate(self):
+        self.enterContext(patch.object(self.scraper, "auth", side_effect=KeyError("bug")))
+
+        with self.assertRaises(KeyError):
+            self.scraper.auth_until_success()
+        self.sleep.assert_not_called()
+
+    def test_reauth_retries_until_login_succeeds(self):
+        self.scraper._auth_args = ("http://captcha.onion/", "l", "p", "k", 5)
+        self.scraper.client.cookies = Mock()
+        self.enterContext(
+            patch.object(
+                self.scraper, "auth", side_effect=[AuthError("x"), "https://main.onion"]
+            )
+        )
+
+        with self.assertLogs("darknet_scraper", level="ERROR"):
+            self.assertEqual(self.scraper.reauth(), "https://main.onion")
 
     def test_gives_up_after_rate_limit_retries(self):
         self.scraper.rate_limit_retries = 2
