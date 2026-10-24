@@ -231,10 +231,18 @@ class Scraper:
             self._slow_down()
             if rate_limited > rate_limit_retries:
                 self._schedule_next(self.request_delay)
-                logger.error(
-                    f"Still rate limited (429) after {rate_limit_retries} "
-                    f"retries for {method} {url}, giving up"
-                )
+                if rate_limit_retries == 0:
+                    # One-shot (captcha/login POST): the caller handles the
+                    # 429 itself, so this isn't a failure yet.
+                    logger.warning(
+                        f"Rate limited (429) on one-shot {method} {url}, "
+                        f"not retrying, returning it to the caller"
+                    )
+                else:
+                    logger.error(
+                        f"Still rate limited (429) after {rate_limit_retries} "
+                        f"retries for {method} {url}, giving up"
+                    )
                 return response
 
             wait = self._schedule_next(
