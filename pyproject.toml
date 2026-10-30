@@ -23,6 +23,7 @@ dependencies = [
 [project.scripts]
 darknet-scraper = "darknet_scraper:main"
 review-progress = "darknet_scraper.progress:main"
+review-audit = "darknet_scraper.review_audit:main"
 
 [build-system]
 requires = ["uv_build>=0.12.13,<0.13.0"]
