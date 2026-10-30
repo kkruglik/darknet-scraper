@@ -176,7 +176,7 @@ class Scraper:
         Every request, auth and retries included, starts at least
         self.request_delay after the previous response, so callers never
         need to sleep between pages themselves. Every 429 multiplies
-        self.request_delay by slow_down_factor and every other response
+        self.request_delay by slow_down_factor and every 2xx response
         takes a fixed speed_up_step off it, down to self.min_delay. Backing
         off hard on a 429 and recovering in small steps keeps the delay just
         above the limit: from a 429 at delay d it takes 2.5*d successes (with
