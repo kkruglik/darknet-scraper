@@ -608,7 +608,7 @@ def main() -> None:
             url,
             headers,
             cookies,
-            request_delay=3.0,
+            request_delay=1.5,
             socks_proxy=proxy,
             control_port=int(os.environ.get("TOR_CONTROL_PORT", DEFAULT_CONTROL_PORT)),
         )
