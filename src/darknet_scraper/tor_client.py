@@ -43,11 +43,15 @@ class TorScraper(Scraper):
         self.control_password = control_password
 
     def __enter__(self) -> "TorScraper":
+        # HTTP/2 like Tor Browser on the https mirrors; plain-http onions
+        # (the captcha mirror) stay on HTTP/1.1, as there's no TLS to
+        # negotiate h2 with.
         self.client = httpx.Client(
             timeout=self.timeout,
             headers=self.headers,
             cookies=self.cookies,
             proxy=self.socks_proxy,
+            http2=True,
         )
         return self
 
