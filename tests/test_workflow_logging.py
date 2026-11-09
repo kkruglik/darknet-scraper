@@ -95,6 +95,30 @@ class WorkflowLoggingTests(unittest.TestCase):
         self.assertEqual(rows["shop_id"].to_list(), [101, 101])
         self.assertEqual(self.scraper.load_url.call_count, 2)
 
+    def test_corrupt_cached_page_is_deleted_and_fetched_again(self):
+        url = self.scraper.build_url("shop_comments", 101)
+        corrupt = self.cache_dir / (self.scraper.hash_url(f"{url}?p=2") + ".json")
+        corrupt.write_text('{"result": [{"author": "trunc')
+        self.scraper.scrape_shop_reviews.return_value = [{"author": "fresh"}]
+
+        with self.assertLogs("darknet_scraper", level="INFO") as logs:
+            self.scrape_reviews()
+
+        self.assertIn("Corrupt cache file", "\n".join(logs.output))
+        self.assertEqual(json.loads(corrupt.read_text())["result"][0]["author"], "fresh")
+        rows = pd.read_csv(self.output_dir / "101.csv")
+        self.assertEqual(rows["author"].to_list(), ["fresh", "fresh"])
+        self.assertEqual(self.scraper.load_url.call_count, 2)
+
+    def test_writes_leave_no_temp_files(self):
+        self.scraper.scrape_shop_reviews.return_value = [{"author": "fresh"}]
+
+        self.scrape_reviews()
+
+        self.assertEqual(list(self.root.rglob("*.tmp")), [])
+        self.assertEqual(len(list(self.cache_dir.glob("*.json"))), 2)
+        self.assertTrue((self.output_dir / "101.csv").exists())
+
     def test_existing_csv_is_logged_and_not_requested(self):
         self.output_dir.mkdir()
         output_file = self.output_dir / "101.csv"
@@ -212,6 +236,19 @@ class CacheKeyTests(unittest.TestCase):
             sorted(p.name for p in self.cache_dir.glob("*.json")),
             sorted([expected, "no_url.json"]),
         )
+
+    def test_migration_deletes_a_corrupt_file_instead_of_crashing(self):
+        legacy = self.legacy_cache_page("http://mirror-a.onion/shop/comments/101/?p=1")
+        corrupt = self.cache_dir / "truncated.json"
+        corrupt.write_text('{"url": "http://mirror-a.onion/shop/comm')
+
+        with self.assertLogs("darknet_scraper", level="WARNING"):
+            migrate_cache_keys(self.scraper, self.cache_dir)
+
+        self.assertFalse(corrupt.exists())
+        self.assertFalse(legacy.exists())
+        expected = Scraper.hash_url("/shop/comments/101/?p=1") + ".json"
+        self.assertEqual([p.name for p in self.cache_dir.glob("*.json")], [expected])
 
     def test_migration_is_noop_for_current_keys(self):
         legacy = self.legacy_cache_page("http://mirror-a.onion/shop/comments/101/?p=1")

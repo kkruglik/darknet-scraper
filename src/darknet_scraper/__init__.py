@@ -140,6 +140,37 @@ def run_supervised(worker: int, run_once: Callable[[int], None]) -> None:
             time.sleep(wait)
 
 
+def write_atomic(path: Path, write: Callable[[Path], None]) -> None:
+    """Write a file via a temp file and a rename, so it's never half-written.
+
+    A container stopped mid-write (every redeploy stops it) used to leave a
+    truncated cache JSON that crashed the next startup, or a truncated CSV
+    that looked like a finished shop. The dot-prefixed .tmp name matches
+    neither *.json nor *.csv, so a leftover one is never read.
+    """
+    tmp = path.with_name(f".{path.name}.tmp")
+    write(tmp)
+    with open(tmp, "rb+") as f:
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    write_atomic(path, lambda tmp: tmp.write_text(json.dumps(data)))
+
+
+def load_cache_entry(path: Path) -> dict | None:
+    """Read a cache file; a corrupt one is deleted and None returned, so the
+    page is simply fetched again instead of crashing the run."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        logger.warning(f"Corrupt cache file {path} ({exc}), deleting it to re-fetch the page")
+        path.unlink(missing_ok=True)
+        return None
+
+
 def migrate_cache_keys(s: Scraper, cache_dir: Path) -> None:
     """Rename cache files keyed by an older hash_url() scheme to the current one.
 
@@ -151,8 +182,8 @@ def migrate_cache_keys(s: Scraper, cache_dir: Path) -> None:
     renamed = 0
     duplicates = 0
     for path in cache_dir.rglob("*.json"):
-        with open(path) as f:
-            page_url = json.load(f).get("url")
+        entry = load_cache_entry(path)
+        page_url = entry.get("url") if entry else None
         if not page_url:
             continue
 
@@ -184,8 +215,8 @@ def scrape_all_shops(
     migrate_cache_keys(s, cache_dir)
 
     for i in cache_dir.rglob("*.json"):
-        with open(i) as f:
-            data = json.load(f)
+        data = load_cache_entry(i)
+        if data is not None:
             cache[i.name] = data
 
     if not cache:
@@ -239,8 +270,7 @@ def scrape_all_shops(
             "found": len(found),
             "result": found,
         }
-        with open(cache_dir / cache_filename, "w") as f:
-            json.dump(entry, f)
+        write_json_atomic(cache_dir / cache_filename, entry)
         cache[cache_filename] = entry
 
         shop_ids.extend(found)
@@ -256,7 +286,9 @@ def scrape_all_shops(
     )
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"shop_id": shop_ids}).to_csv(output_file, index=False)
+    write_atomic(
+        output_file, lambda tmp: pd.DataFrame({"shop_id": shop_ids}).to_csv(tmp, index=False)
+    )
     logger.info(
         f"Saved {len(shop_ids)} shop IDs to {output_file} "
         f"in {time.monotonic() - started_at:.1f}s"
@@ -343,15 +375,17 @@ def scrape_all_reviews(
             cache_filename = f"{url_hash}.json"
 
             if cache_filename in cached_pages:
-                with open(cache_dir / cache_filename) as f:
-                    cached_reviews = json.load(f)["result"]
-                shop_reviews.extend(cached_reviews)
-                logger.info(
-                    f"Shop {shop_id}, review page {page_num}/{last_page}: "
-                    f"loaded {len(cached_reviews)} reviews from cache"
-                )
-                page_pbar.set_postfix(reviews=len(shop_reviews))
-                continue
+                cached = load_cache_entry(cache_dir / cache_filename)
+                if cached is not None:
+                    cached_reviews = cached["result"]
+                    shop_reviews.extend(cached_reviews)
+                    logger.info(
+                        f"Shop {shop_id}, review page {page_num}/{last_page}: "
+                        f"loaded {len(cached_reviews)} reviews from cache"
+                    )
+                    page_pbar.set_postfix(reviews=len(shop_reviews))
+                    continue
+                cached_pages.discard(cache_filename)
 
             # Page 1 is the page already loaded to read the pagination, so
             # reuse it instead of requesting the same content twice.
@@ -386,8 +420,7 @@ def scrape_all_reviews(
                 "result": reviews,
                 "shop_id": shop_id,
             }
-            with open(cache_dir / cache_filename, "w") as f:
-                json.dump(entry, f)
+            write_json_atomic(cache_dir / cache_filename, entry)
             cached_pages.add(cache_filename)
 
             shop_reviews.extend(reviews)
@@ -409,7 +442,12 @@ def scrape_all_reviews(
             log_progress(f"[{shop_num}/{total_shops}] Shop {shop_id}: incomplete, CSV not written")
             continue
 
-        pd.DataFrame(shop_reviews, columns=REVIEW_COLUMNS).to_csv(shop_csv, index=False)
+        write_atomic(
+            shop_csv,
+            lambda tmp: pd.DataFrame(shop_reviews, columns=REVIEW_COLUMNS).to_csv(
+                tmp, index=False
+            ),
+        )
         scraped_shops += 1
         written_reviews += len(shop_reviews)
         log_progress(
@@ -486,10 +524,12 @@ def scrape_all_products(
             cache_filename = f"{url_hash}.json"
 
             if cache_filename in cached_pages:
-                with open(cache_dir / cache_filename) as f:
-                    shop_products.extend(json.load(f)["result"])
-                page_pbar.set_postfix(products=len(shop_products))
-                continue
+                cached = load_cache_entry(cache_dir / cache_filename)
+                if cached is not None:
+                    shop_products.extend(cached["result"])
+                    page_pbar.set_postfix(products=len(shop_products))
+                    continue
+                cached_pages.discard(cache_filename)
 
             # Page 1 is the page already loaded for shop info and pagination.
             if page_num == 1:
@@ -519,8 +559,7 @@ def scrape_all_products(
                 "result": products,
                 "shop_id": shop_id,
             }
-            with open(cache_dir / cache_filename, "w") as f:
-                json.dump(entry, f)
+            write_json_atomic(cache_dir / cache_filename, entry)
             cached_pages.add(cache_filename)
 
             shop_products.extend(products)
@@ -537,8 +576,11 @@ def scrape_all_products(
         for product in shop_products:
             product.update(shop_info)
 
-        pd.DataFrame(shop_products, columns=PRODUCT_COLUMNS).to_csv(
-            shop_csv, index=False
+        write_atomic(
+            shop_csv,
+            lambda tmp: pd.DataFrame(shop_products, columns=PRODUCT_COLUMNS).to_csv(
+                tmp, index=False
+            ),
         )
         scraped_shops += 1
         log_progress(
