@@ -697,13 +697,6 @@ def main() -> None:
                 workers,
             )
 
-    # Once, before the workers start: concurrent renames in one cache dir
-    # would race each other.
-    for cache_dir in (config.scrape_products.cache_dir, config.scrape_reviews.cache_dir):
-        cache_dir = resolve(cache_dir)
-        if cache_dir.exists():
-            migrate_cache_keys(Scraper, cache_dir)
-
     shops_file = resolve(config.scrape_shops.output_file)
     if shops_file.exists():
         logger.info(f"Phase 1: skipped, {shops_file} already exists")
